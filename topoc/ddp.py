@@ -8,196 +8,99 @@ from jax import lax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
-def DDP():
+from topoc.base import TOProblemDefinition, TOAlgorithm
+from topoc.types import *
+from topoc.utils import *
+
+class DDP():
     """Finite horizon Discrete-time Differential Dynamic Programming(DDP)"""
 
     def __init__(
         self,
-        Nx: int,
-        Nu: int,
-        dynamics: Callable,
-        inst_cost: Callable,
-        terminal_cost: Callable,
-        tolerance: float = 1e-5,
-        max_iters: int = 200,
-        with_hessians: bool = False,
-        constrain: bool = False,
-        alphas: ArrayLike = [1.0],
+        toproblem: TOProblemDefinition,
+        toalgorithm: TOAlgorithm,
     ):
-        self.Nx = Nx
-        self.Nu = Nu
-        self.dynamics = dynamics
-        self.inst_cost = inst_cost
-        self.terminal_cost = terminal_cost
-        self.tolerance = tolerance
-        self.max_iters = max_iters
-        self.with_hessians = with_hessians
-        self.constrain = constrain
-        self.alphas = alphas
+        
+        self.toproblem = toproblem
+        self.toalgorithm = toalgorithm
 
-    def forward_pass(
-        Xs: Array,
-        Us: Array,
-        Ks: Array,
-        ks: Array,
-        dynamics: Callable,
-        runningcost: Callable,
-        finalcost: Callable,
-        dt: float,
-        eps: float = 1.0, # linear search parameter
-    ) -> Tuple[Tuple[Array, Array], float]:
-        """
-        Perform a forward pass.
+        Nx = toproblem.modelparams.state_dim
+        Nu = toproblem.modelparams.input_dim
+        H = toproblem.modelparams.horizon_len
 
-        Parameters
-        ----------
-        Xs : Array
-            The target state trajectory.
-        Us : Array
-            The control trajectory.
-        Ks : Gains
-            The gains obtained from the Backward Pass.
-        dynamics : Callable
-            The dynamics function of the system.
-        runningcost : Callable
-            The running cost function.
-        finalcost : Callable
-            The final cost function.
-        eps : float, optional
-            The linesearch parameter, by default 1.0.
+        def solve():
 
-        Returns
-        -------
-        [[NewStates, NewControls], TotalCost] -> Tuple[Tuple[Array, Array], float]
-            A tuple containing the updated state trajectory and control trajectory, and the total cost
-            of the trajectory.
-        """
+            # region: Initialize Simulation
 
-        def dynamics_step(scan_state, scan_input):
-            x, traj_cost = scan_state
-            x_bar, u_bar, K, k = scan_input
+            # TODO: Add starting start state and goal state in TOProblemDefinition
+        
+            xbar = jnp.zeros((H, Nx)) # TODO: replace with initial state
+            ubar = jnp.zeros((H-1, Nu))
+            k = jnp.zeros((H-1, Nu))
+            K = jnp.zeros((H-1, Nu, Nx))
 
-            delta_x = x - x_bar
-            delta_u = K @ delta_x + eps * k
-            u_hat = u_bar + delta_u
-            nx_hat = dynamics(x, u_hat)
-            traj_cost = traj_cost + dt * runningcost(x, u_hat)
-            # (x_t+1, V_t), (x_t+1, u_t)
-            return (nx_hat, traj_cost), (nx_hat, u_hat)
+            (xbar, ubar), Vbar = forward_pass(xbar, ubar, K, k, toproblem)
 
-        (xf, traj_cost), (new_Xs, new_Us) = lax.scan(
-            dynamics_step, init=(Xs[0], 0.0), xs=(Xs[:-1], Us, Ks, ks)
-        )
-        total_cost = traj_cost + finalcost(xf)
-        new_Xs = jnp.vstack([Xs[0], new_Xs])
-        return (new_Xs, new_Us), total_cost
+            # endregion: Initialize Simulation
 
-    def backward_pass(fx, fu, lx, lu, lxx, luu, lux, l_final_x, l_final_xx, reg=1e-5):
-        """
-        iLQR/DDP backward pass using JAX with regularization, Cholesky PD check,
-        and computation of expected cost decrease dV.
+            # region: Algorithm Iterations
 
-        Args:
-            fx, fu, lx, lu, lxx, luu, lux: time-major cost/dynamics derivatives
-            l_final_x, l_final_xx: final value function derivatives
-            reg: regularization scalar
+            iter = 1
+            Vstore = [Vbar]
+            regularization = 0.0
 
-        Returns:
-            K_seq: [T, m, n] feedback gains
-            k_seq: [T, m] feedforward terms
-            V_xs: [T+1, n] value function gradient trajectory
-            V_xxs: [T+1, n, n] value function Hessian trajectory
-            dV_seq: [T] expected scalar cost decrease at each step
-            success: boolean, True if all Quu are PD
-        """
+            while True:
 
-        T = fx.shape[0]
-        n = fx.shape[1]
-        m = fu.shape[2]
+                print(f"Iteration: {iter}")
 
-        def backward_step(carry, inputs):
-            V_x, V_xx, success = carry
-            fx_t, fu_t, lx_t, lu_t, lxx_t, luu_t, lux_t = inputs
+                # region: Backward Pass
 
-            Q_x = lx_t + fx_t.T @ V_x
-            Q_u = lu_t + fu_t.T @ V_x
-            Q_xx = lxx_t + fx_t.T @ V_xx @ fx_t
-            Q_ux = lux_t + fu_t.T @ V_xx @ fx_t
-            Q_uu = luu_t + fu_t.T @ V_xx @ fu_t
+                success = False
 
-            # Add regularization to Qxx and Quu
-            Q_xx = Q_xx + reg * jnp.eye(n)
-            Q_uu = Q_uu + reg * jnp.eye(m)
+                while not success:
 
-            # Try Cholesky decomposition
-            def on_pd(L):
-                # Solve using Cholesky
-                k = -jax.scipy.linalg.cho_solve((L, True), Q_u)
-                K = -jax.scipy.linalg.cho_solve((L, True), Q_ux)
+                    trajderivatives = traj_batch_derivatives(xbar, ubar, toproblem)
+                     # TODO: Add use of second order information based on algorithm type
+                    dV, success, K, k = backward_pass(trajderivatives, use_second_order_info=False)
 
-                # Value function update
-                V_x_new = Q_x + K.T @ Q_uu @ k + K.T @ Q_u + Q_ux.T @ k
-                V_xx_new = Q_xx + K.T @ Q_uu @ K + K.T @ Q_ux + Q_ux.T @ K
+                    if not success:
+                        regularization = max(regularization * 4, 1e-3)
 
-                # Scalar cost decrease approximation
-                dV = -Q_u.T @ k
+                regularization = regularization / 20
+                if regularization < 1e-6:
+                    regularization = 0.0
 
-                return (V_x_new, V_xx_new, True), (K, k, V_x_new, V_xx_new, dV)
 
-            def on_fail():
-                dummy_K = jnp.zeros((m, n))
-                dummy_k = jnp.zeros((m,))
-                dV = jnp.array(0.0)
-                return (V_x, V_xx, False), (dummy_K, dummy_k, V_x, V_xx, dV)
+                Vprev = Vbar
 
-            def try_chol(Q_uu):
-                try:
-                    L = jax.scipy.linalg.cholesky(Q_uu, lower=True)
-                    return True, L
-                except:
-                    return False, jnp.zeros_like(Q_uu)
+                xbar, ubar, Vbar, eps, done = forward_iteration(
+                    xbar, ubar, K, k, Vprev, dV, toproblem, toalgorithm, max_iters=20
+                )
 
-            def try_chol_safe(Q_uu):
-                # JAX needs branchable logic
-                eps = 1e-9
-                Q_uu_test = Q_uu - eps * jnp.eye(m)
-                eigvals = jnp.linalg.eigvalsh(Q_uu_test)
-                is_pd = jnp.all(eigvals > 0.0)
+                if not done:
+                    print("Line Search didn't succeed. Try playing with gamma/beta/max_iters.")
+                    break
 
-                L = jax.scipy.linalg.cholesky(Q_uu + 1e-9 * jnp.eye(m), lower=True)
-                return is_pd, L
+                Vstore.append(Vbar)
+                Change = Vprev - Vbar
 
-            is_pd, L = try_chol_safe(Q_uu)
+                iter += 1
 
-            # Branch based on PD status
-            (carry_out, output) = lax.cond(
-                is_pd & success,
-                lambda _: on_pd(L),
-                lambda _: on_fail(),
-                operand=None
-            )
+                if Change < 1e-9 or iter > 100:
+                    print(f"Converged in {iter} iterations.")
+                    break
 
-            return carry_out, output
 
-        # Prepare input sequence
-        scaninputs = (fx, fu, lx, lu, lxx, luu, lux)
+            return xbar, ubar, Vstore      
 
-        # Initial state
-        init_scanstate = (l_final_x, l_final_xx, True)
+                    
 
-        # Run backward scan
-        (V_x_T, V_xx_T, success), (K_seq_rev, k_seq_rev, V_xs_rev, V_xxs_rev, dV_seq_rev) = lax.scan(
-            backward_step,
-            init=init_scanstate,
-            xs=scaninputs,
-            reverse=True
-        )
+                
+        
 
-        # Time forward results
-        K_seq = K_seq_rev[::-1]
-        k_seq = k_seq_rev[::-1]
-        V_xs = jnp.concatenate([V_xs_rev[::-1], l_final_x[None, :]], axis=0)
-        V_xxs = jnp.concatenate([V_xxs_rev[::-1], l_final_xx[None, :, :]], axis=0)
-        dV_seq = dV_seq_rev[::-1]
 
-        return K_seq, k_seq, V_xs, V_xxs, dV_seq, success
+
+
+        
+
+

@@ -8,6 +8,9 @@ from jax.typing import ArrayLike
 import jax.numpy as jnp
 from enum import Enum
 
+from topoc.utils import linearize, quadratize
+from topoc.types import *
+
 class TOSolve:
     """
     Class to solve the trajectory optimization problem using the specified algorithm.
@@ -57,17 +60,22 @@ class TOSolve:
         # Implement logging or summary logic here
         print(f"Log for {self.algorithm.algo_type}: {self.result}")
 
-# region: TOProblemDefinition
 class TOProblemDefinition():
     """
     Trajectory Optimization Problem Definition.
     """
     def __init__(
         self,
-        runningcost: "RunningCostFn",
-        finalcost: "TerminalCostFn",
-        dynamics: "DynamicsFn",
-        modelparams: "ModelParams",
+        runningcost: RunningCostFn,
+        terminalcost: TerminalCostFn,
+        dynamics: DynamicsFn,
+        modelparams: ModelParams,
+        graddynamics: Optional[GradDynamicsFn] = None,
+        hessiandynamics: Optional[HessianDynamicsFn] = None,
+        gradrunningcost: Optional[GradRunningCostFn] = None,
+        hessianrunningcost: Optional[HessianRunningCostFn] = None,
+        gradterminalcost: Optional[GradTerminalCostFn] = None,
+        hessiantterminalcost: Optional[HessianTerminalCostFn] = None,
     ):
         """
         Trajectory Optimization Problem initialization.
@@ -76,87 +84,31 @@ class TOProblemDefinition():
         ----------
         runningcost : RunningCostFn
             Running cost function (t, x, u, params).
-        finalcost : FinalCostFn
-            Final cost function (xf, params).
+        terminalcost : TerminalCostFn
+            Terminal cost function (xf, params).
         dynamics : DynamicsFn
             Dynamics function (t, x, u, params).
         modelparams : ModelParams
             Model Parameters e.g. state_dim, input_dim, horizon_len, dt.
         """
         self.runningcost = runningcost
-        self.finalcost = finalcost
+        self.terminalcost = terminalcost
         self.dynamics = dynamics
         self.modelparams = modelparams
+        self.graddynamics = graddynamics if graddynamics is not None else linearize(dynamics)
+        self.hessiandynamics = hessiandynamics if hessiandynamics is not None else quadratize(dynamics)
+        self.gradrunningcost = gradrunningcost if gradrunningcost is not None else linearize(runningcost)
+        self.hessianrunningcost = hessianrunningcost if hessianrunningcost is not None else quadratize(runningcost)
+        self.gradterminalcost = gradterminalcost if gradterminalcost is not None else linearize(terminalcost)
+        self.hessiantterminalcost = hessiantterminalcost if hessiantterminalcost is not None else quadratize(terminalcost)
 
-class ModelParams(NamedTuple):
-    """Model Parameters"""
-
-    state_dim: int
-    input_dim: int
-    horizon_len: int
-    dt: float
-
-RunningCostFn = Callable[[Array, Array], Array]
-GradRunningCostFn = Callable[[Array, Array], Tuple[Array, Array]]
-HessianRunningCostFn = Callable[
-    [Array, Array], Tuple[Tuple[Array, Array], Tuple[Array, Array]]
-]
-
-TerminalCostFn = Callable[[Array, Array], Array]
-GradTerminalCostFn = Callable[[Array, Array], Tuple[Array, Array]]
-HessianTerminalCostFn = Callable[
-    [Array, Array], Tuple[Tuple[Array, Array], Tuple[Array, Array]]
-]
-
-DynamicsFn = Callable[[Array, Array], Array]
-GradDynamicsFn = Callable[[Array, Array], Tuple[Array, Array]]
-HessianDynamicsFn = Callable[
-    [Array, Array], Tuple[Tuple[Array, Array], Tuple[Array, Array]]
-]
-
-# endregion: TOProblemDefinition
-
-# region: TOAlgorithm
 
 class TOAlgorithm:
-    def __init__(self, algo_type: "AlgorithmName", **kwargs):
+    def __init__(self, algo_type: AlgorithmName, **kwargs):
         param_class = algorithm_param_classes.get(algo_type)
         if param_class is None:
             raise ValueError(f"Unknown algorithm: {algo_type}")
         self.algo_type = algo_type
         self.params = param_class(**kwargs)
 
-class AlgorithmName(Enum):
-    RDDP1 = "RDDP1: Randomized DDP with Smoothing in state and control space"
-    RDDP2 = "RDDP2: Randomized DDP with Smoothing only in control space"
-    SPDDP = "SPDDP: Sigma Point Differential Dynamic Programming"
-    SPPDP = "SPPDP: Sigma Point Probabilistic Dynamic Programming"
 
-class AlgorithmParams:
-    """Namespace for all algorithm parameter classes."""
-
-    class RDDP1Params:
-        def __init__(self, alpha: float, beta: int):
-            self.alpha = alpha
-            self.beta = beta
-    class RDDP2Params:
-        def __init__(self, gamma: float):
-            self.gamma = gamma
-
-    class SPDDPParams:
-        def __init__(self, delta: float):
-            self.delta = delta
-
-    class SPPDPParams:
-        def __init__(self, epsilon: float):
-            self.epsilon = epsilon
-
-# Mapping from AlgorithmName to parameter class
-algorithm_param_classes = {
-    AlgorithmName.RDDP1: AlgorithmParams.RDDP1Params,
-    AlgorithmName.RDDP2: AlgorithmParams.RDDP2Params,
-    AlgorithmName.SPDDP: AlgorithmParams.SPDDPParams,
-    AlgorithmName.SPPDP: AlgorithmParams.SPPDPParams,
-}
-
-# endregion: TOAlgorithm
