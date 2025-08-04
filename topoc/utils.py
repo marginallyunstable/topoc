@@ -2,6 +2,7 @@
 
 from typing import Callable, Tuple, Any, Optional, TYPE_CHECKING
 import jax
+from jax import random
 from jax import Array, lax, debug, profiler
 import jax.numpy as jnp
 import functools
@@ -324,6 +325,131 @@ def traj_batch_derivatives(
         lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
         lfx=lfx, lfxx=lfxx
     )
+
+
+# region: Smoothed Trajectory Derivatives
+@partial(jax.jit, static_argnums=(2, 4, 5, 6))
+def smoothed_traj_batch_derivatives(
+    Xs,  # (N, Nx)
+    Us,  # (N-1, Nu)
+    toproblem: "TOProblemDefinition",
+    sigma: float = 1e-3,
+    N_samples: int = 1000,
+    seed: int = 0,
+    key: jax.Array = None,
+):
+    """
+    Compute all derivatives for a trajectory using smoothed_dynamics_derivatives for dynamics part.
+    Returns:
+        TrajDerivatives object with attributes:
+            fx, fu: (N-1, Nx, Nx), (N-1, Nx, Nu)
+            fxx, fxu, fux, fuu: (N-1, Nx, Nx, Nx), (N-1, Nx, Nx, Nu), (N-1, Nx, Nu, Nx), (N-1, Nx, Nu, Nu)
+            lx, lu: (N-1, Nx), (N-1, Nu)
+            lxx, lxu, lux, luu: (N-1, Nx, Nx), (N-1, Nx, Nu), (N-1, Nu, Nx), (N-1, Nu, Nu)
+            lfx: (Nx,)
+            lfxx: (Nx, Nx)
+    """
+    # Use provided key or create from seed
+    if key is None:
+        key = random.PRNGKey(seed)
+    # Get cost derivatives as usual
+    gradrunningcost = toproblem.gradrunningcost
+    hessianrunningcost = toproblem.hessianrunningcost
+    gradterminalcost = toproblem.gradterminalcost
+    hessiantterminalcost = toproblem.hessiantterminalcost
+
+    # Prepare dynamics functions
+    f = toproblem.dynamics
+    fx = jax.jacrev(f, argnums=0)
+    fxx = jax.hessian(f, argnums=0)
+
+    # For each (x, u), call smoothed_dynamics_derivatives with a split key
+    def smoothed_dyn_for_t(args):
+        x, u, key = args
+        return smoothed_dynamics_derivatives(x, u, f, fx, fxx, key, sigma, N_samples)
+
+    # Split key for each time step
+    keys = random.split(key, Us.shape[0])
+    # Map over time steps
+    fx_s, fxx_s, fu_s, fux_s, fuu_s = jax.vmap(smoothed_dyn_for_t)((Xs[:-1], Us, keys))
+
+    # Cost derivatives as usual
+    lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
+    (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+
+    # Terminal cost on last state (Xs[-1])
+    lfx = gradterminalcost(Xs[-1])
+    lfxx = hessiantterminalcost(Xs[-1])
+
+    return TrajDerivatives(
+        fxs=fx_s, fus=fu_s,
+        fxxs=fxx_s, fxus=None, fuxs=fux_s, fuus=fuu_s,
+        lxs=lxs, lus=lus,
+        lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
+        lfx=lfx, lfxx=lfxx
+    )
+# endregion: Smoothed Trajectory Derivatives
+
+def smoothed_dynamics_derivatives(
+    x,
+    u,
+    f,
+    fx,
+    fxx,
+    key,
+    sigma: float = 1e-3,
+    N: int = 1000,
+):
+    """
+    JAX/jittable, vectorized version of smoothed_dynamicsInfo.
+    Uses (N, Nx) and (N, Nu) conventions for batching.
+    Returns: fx_s, fxx_s, fu_s, fux_s, fuu_s
+    """
+    C = jnp.sqrt(sigma)
+    Nx = x.shape[0]
+    Nu = u.shape[0]
+
+    # Sample perturbations [N, Nu]
+    eps = jax.random.normal(key, (N, Nu))
+    u_plus = u + C * eps  # [N, Nu]
+    u_minus = u - C * eps  # [N, Nu]
+
+    # Vectorized evaluation of f, fx, fxx
+    f_plus = jax.vmap(lambda up: f(x, up))(u_plus)  # [N, Nx]
+    f_minus = jax.vmap(lambda um: f(x, um))(u_minus)  # [N, Nx]
+    # fs = (f_plus + f_minus) / 2  # [N, Nx]
+
+    fx_all = jax.vmap(lambda up: fx(x, up))(u_plus)  # [N, Nx, Nx]
+    fx_s = jnp.mean(fx_all, axis=0)  # [Nx, Nx]
+
+    fxx_all = jax.vmap(lambda up: fxx(x, up))(u_plus)  # [N, Nx, Nx, Nx]
+    fxx_s = jnp.mean(fxx_all, axis=0)  # [Nx, Nx, Nx]
+
+    # fu
+    fu_diff = (f_plus - f_minus) / (2 * C)  # [N, Nx]
+    # [N, Nx] @ [N, Nu] -> [Nx, Nu]
+    fu_s = (fu_diff.T @ eps) / N  # [Nx, Nu]
+
+    # fuu
+    f0 = f(x, u)  # [Nx]
+    delta_f = f_plus + f_minus - 2 * f0  # [N, Nx]
+    # eps_outer: [N, Nu, Nu]
+    eps_outer = eps[:, :, None] * eps[:, None, :]  # [N, Nu, Nu]
+    eps_outer = eps_outer - jnp.eye(Nu)[None, :, :]  # [N, Nu, Nu]
+    # fuu_s: [Nx, Nu, Nu]
+    fuu_s = jnp.einsum('nd,nij->dij', delta_f, eps_outer) / (2 * C**2 * N)
+
+    # fx(x, u ± sigma*eps)
+    fx_plus = jax.vmap(lambda up: fx(x, up))(u_plus)  # [N, Nx, Nx]
+    fx_minus = jax.vmap(lambda um: fx(x, um))(u_minus)  # [N, Nx, Nx]
+    fx_diff = (fx_plus - fx_minus) / (2 * C)  # [N, Nx, Nx]
+    # fux: [Nx, Nu, Nx]
+    # [N, Nx, Nx] and [N, Nu] -> [Nx, Nu, Nx]
+    fux_s = jnp.einsum('nij,ni->jin', fx_diff, eps) / N
+
+    return fx_s, fxx_s, fu_s, fux_s, fuu_s
+
+
 
 def QInfo(
     ctsdinfo: WaypointDerivatives,

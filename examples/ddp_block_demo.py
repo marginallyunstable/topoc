@@ -58,6 +58,6 @@ print("Use second order info:", algorithm.params.use_second_order_info)
 
 # Example usage: create and solve the problem
 solver = TOSolve(toprob, algorithm)
-# print("Solver result:", solver.result)
+print("Solver result:", solver.result)
 # solver.visualize()
 # solver.show_log()
