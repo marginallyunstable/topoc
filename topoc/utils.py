@@ -1,13 +1,18 @@
 """Utility Functions"""
 
-from typing import Callable, Tuple, Any, Optional
+from typing import Callable, Tuple, Any, Optional, TYPE_CHECKING
 import jax
-from jax import Array, lax
+from jax import Array, lax, debug, profiler
 import jax.numpy as jnp
 import functools
+from functools import partial
+import time
 
-from topoc.base import TOProblemDefinition, TOAlgorithm
 from topoc.types import *
+
+if TYPE_CHECKING:
+    from topoc.base import TOProblemDefinition, TOAlgorithm
+    
 
 # region: Mathematical Functions
 
@@ -88,36 +93,37 @@ def quadratize(fun: Callable) -> Callable:
 # endregion: Mathematical Functions
 
 # region: Cost Functions for TOProblemDefinition
-# TODO: Add goal state to cost functions
-def quadratic_running_cost(x: Array, u: Array, params: Optional[Any] = None) -> Array:
+
+def quadratic_running_cost(x: Array, u: Array , xg: Array, params: Optional[Any] = None) -> Array:
     """
     Quadratic running cost: 0.5 * (x^T Q x + u^T R u)
     params should be a dict with 'Q' and 'R' arrays.
     """
     Q = params["Q"] if params and "Q" in params else jnp.eye(x.shape[0])
     R = params["R"] if params and "R" in params else jnp.eye(u.shape[0])
-    cost = 0.5 * (x.T @ Q @ x + u.T @ R @ u)
+    cost = 0.5 * ((x-xg).T @ Q @ (x-xg) + u.T @ R @ u)
     return cost
 
-def quadratic_terminal_cost(x: Array, params: Optional[Any] = None) -> Array:
+def quadratic_terminal_cost(x: Array, xg: Array, params: Optional[Any] = None) -> Array:
     """
     Quadratic terminal cost: 0.5 * (x^T P x)
     params should be a dict with 'P' array.
     """
     P = params["P"] if params and "P" in params else jnp.eye(x.shape[0])
-    cost = 0.5 * (x.T @ P @ x)
+    cost = 0.5 * ((x-xg).T @ P @ (x-xg))
     return cost
 
 # endregion: Cost Functions for TOProblemDefinition
 
 # region: Functions for Algorithms
 
+@partial(jax.jit, static_argnums=4)
 def forward_pass(
         Xs: Array,
         Us: Array,
         Ks: Array,
         ks: Array,
-        toproblem: TOProblemDefinition,
+        toproblem: "TOProblemDefinition",
         eps: float = 1.0, # linear search parameter
     ) -> Tuple[Tuple[Array, Array], float]:
         """
@@ -171,6 +177,7 @@ def forward_pass(
         new_Xs = jnp.vstack([Xs[0], new_Xs])
         return (new_Xs, new_Us), total_cost
 
+@jax.jit
 def backward_pass(
     trajderivatives: TrajDerivatives,
     reg: float = 0.0, # Regularization term for Quu
@@ -179,19 +186,11 @@ def backward_pass(
     """
     iLQR/DDP backward pass using JAX with regularization, Cholesky PD check,
     and computation of expected cost decrease dV.
-
-    Returns:
-        K_seq: [T, m, n] feedback gains
-        k_seq: [T, m] feedforward terms
-        Vx_seq: [T, n] value function gradients
-        Vxx_seq: [T, n, n] value function Hessians
-        dV: expected cost decrease (scalar)
-        success: boolean, True if all Quu are PD
     """
-
     scaninputs_dict = trajderivatives._asdict()
     lfx = scaninputs_dict.pop('lfx')
     lfxx = scaninputs_dict.pop('lfxx')
+    scaninputs_dict = {TRAJ_TO_WAYPOINT_RENAME_MAP.get(k, k): v for k, v in scaninputs_dict.items()}
     scaninputs = WaypointDerivatives(**scaninputs_dict)
     init_scanstate = (0.0, lfx, lfxx, True)
 
@@ -199,10 +198,13 @@ def backward_pass(
         dV, Vx, Vxx, success = scanstate
 
         def skip_step(_):
+            # Use the same shapes as in compute_step
             m = scaninput.fu.shape[1]
-            n = scaninput.fx.shape[0]
+            n = scaninput.fx.shape[1]
             dummy_K = jnp.zeros((m, n))
             dummy_k = jnp.zeros((m,))
+            # # Print shapes for debugging
+            # print("skip_step shapes: dummy_K", dummy_K.shape, "dummy_k", dummy_k.shape, "Vx", Vx.shape, "Vxx", Vxx.shape)
             return (dV, Vx, Vxx, False), (dummy_K, dummy_k, Vx, Vxx)
 
         def compute_step(_):
@@ -223,11 +225,15 @@ def backward_pass(
                 V_x_new = Qx + Qux.T @ k
                 V_xx_new = Qxx + Qux.T @ K
                 dV_new = dV + Qu.T @ k
+                # # Print shapes for debugging
+                # print("compute_step shapes: K", K.shape, "k", k.shape, "V_x_new", V_x_new.shape, "V_xx_new", V_xx_new.shape)
                 return (dV_new, V_x_new, V_xx_new, True), (K, k, V_x_new, V_xx_new)
 
             def on_fail():
                 dummy_K = jnp.zeros((m, n))
                 dummy_k = jnp.zeros((m,))
+                # # Print shapes for debugging
+                # print("on_fail shapes: dummy_K", dummy_K.shape, "dummy_k", dummy_k.shape, "Vx", Vx.shape, "Vxx", Vxx.shape)
                 return (dV, Vx, Vxx, False), (dummy_K, dummy_k, Vx, Vxx)
 
             def try_chol_safe(Q_uu):
@@ -260,8 +266,14 @@ def backward_pass(
         reverse=True
     )
 
+    # # Print shapes of scan_outputs for debugging
+    # print("scan_outputs lengths:", [len(x) for x in scan_outputs])
+    # for i, x in enumerate(zip(*scan_outputs)):
+    #     shapes = [a.shape for a in x]
+    #     print(f"scan_output step {i} shapes:", shapes)
+
     # Unpack and reverse outputs to forward-time order
-    K_seq_rev, k_seq_rev, Vx_seq_rev, Vxx_seq_rev = [jnp.stack(x) for x in zip(*scan_outputs)]
+    K_seq_rev, k_seq_rev, Vx_seq_rev, Vxx_seq_rev = scan_outputs
     K_seq = K_seq_rev[::-1]
     k_seq = k_seq_rev[::-1]
     Vx_seq = jnp.concatenate([Vx_seq_rev[::-1], lfx[None, :]], axis=0)
@@ -269,10 +281,11 @@ def backward_pass(
 
     return dV, success, K_seq, k_seq, Vx_seq, Vxx_seq
 
+@partial(jax.jit, static_argnums=2)
 def traj_batch_derivatives(
     Xs,  # (N, Nx)
     Us,  # (N-1, Nu)
-    toproblem: TOProblemDefinition,
+    toproblem: "TOProblemDefinition",
 ):
     """
     Compute all derivatives for a trajectory using linearize/quadratize signatures.
@@ -341,6 +354,7 @@ def QInfo(
 
     return QDerivatives(Qx=Qx, Qu=Qu, Qxx=Qxx, Qux=Qux, Quu=Quu)
 
+@partial(jax.jit, static_argnums=(6, 7, 8))
 def forward_iteration(
     Xs,
     Us,
@@ -348,9 +362,9 @@ def forward_iteration(
     ks,
     Vprev,
     dV,
-    toproblem: TOProblemDefinition,
-    algorithm: TOAlgorithm,
-    max_iters=20,
+    toproblem: "TOProblemDefinition",
+    algorithm: "TOAlgorithm",
+    max_iters: int = 50,  # Maximum number of backtracking steps
 ):
     """
     JIT-compatible line search with backtracking for DDP/iLQR forward pass.
@@ -375,32 +389,47 @@ def forward_iteration(
         Us_new: New control trajectory
         eps: Step size used
     """
-    
-    
-    # gamma = params.gamma if hasattr(params, "gamma") else params["gamma"]
-    # beta = params.beta if hasattr(params, "beta") else params["beta"]
     gamma = algorithm.params.gamma
     beta = algorithm.params.beta
+
+    # # JIT-compile forward_pass with static_argnums for toproblem
+    # forward_pass_jit = jax.jit(forward_pass, static_argnums=4)
 
     def body_fn(scanstate, _):
         eps, V, Xs_new, Us_new, done = scanstate
 
         def do_update(_):
+            print("Starting forward_pass...")  # Changed from forward_pass_jit
+            start_fp = time.time()
             (Xs_new1, Us_new1), V1 = forward_pass(
                 Xs, Us, Ks, ks, toproblem, eps
             )
+            end_fp = time.time()
+            print(f"forward_pass took {end_fp - start_fp:.8f} seconds")
+
+            print("Evaluating acceptance condition...")
+            start_cond = time.time()
             accept = V1 < Vprev + gamma * eps * (1 - eps / 2) * dV
             new_eps = lax.select(accept, eps, beta * eps)
             new_done = done | accept
             Xs_out = lax.select(accept, Xs_new1, Xs_new)
             Us_out = lax.select(accept, Us_new1, Us_new)
             V_out = lax.select(accept, V1, V)
-            return (new_eps, V_out, Xs_out, Us_out, new_done)
+            end_cond = time.time()
+            print(f"Acceptance condition evaluation took {end_cond - start_cond:.8f} seconds")
+
+            return (new_eps, V_out, Xs_out, Us_out, new_done), None
 
         def do_nothing(_): # Latch the state
-            return (eps, V, Xs_new, Us_new, done)
+            return (eps, V, Xs_new, Us_new, done), None
 
-        return lax.cond(done, do_nothing, do_update, operand=None)
+        print("Checking done condition...")
+        start_done = time.time()
+        result = lax.cond(done, do_nothing, do_update, operand=None)
+        end_done = time.time()
+        print(f"Done condition check took {end_done - start_done:.8f} seconds")
+
+        return result
 
     # Initial values
     eps_ini = 1.0
@@ -410,13 +439,17 @@ def forward_iteration(
     done_ini = False
 
     scanstate = (eps_ini, V_ini, Xs_ini, Us_ini, done_ini)
+    print("Starting lax.scan...")
+    start_scan = time.time()
     finalscanstate, _ = lax.scan(body_fn, scanstate, xs=None, length=max_iters)
+    
+
     eps, V, Xs_new, Us_new, done = finalscanstate
 
+    end_scan = time.time()
+    print(f"lax.scan took {end_scan - start_scan:.8f} seconds")
+
     return Xs_new, Us_new, V, eps, done
-
-
-
 
 
 # endregion: Functions for Algorithms

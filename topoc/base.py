@@ -69,6 +69,8 @@ class TOProblemDefinition():
         runningcost: RunningCostFn,
         terminalcost: TerminalCostFn,
         dynamics: DynamicsFn,
+        starting_state: ArrayLike,
+        goal_state: ArrayLike,
         modelparams: ModelParams,
         graddynamics: Optional[GradDynamicsFn] = None,
         hessiandynamics: Optional[HessianDynamicsFn] = None,
@@ -83,17 +85,19 @@ class TOProblemDefinition():
         Parameters
         ----------
         runningcost : RunningCostFn
-            Running cost function (t, x, u, params).
+            Running cost function (x, u).
         terminalcost : TerminalCostFn
-            Terminal cost function (xf, params).
+            Terminal cost function (xf).
         dynamics : DynamicsFn
-            Dynamics function (t, x, u, params).
+            Dynamics function (x, u).
         modelparams : ModelParams
             Model Parameters e.g. state_dim, input_dim, horizon_len, dt.
         """
         self.runningcost = runningcost
         self.terminalcost = terminalcost
         self.dynamics = dynamics
+        self.starting_state = jnp.array(starting_state)
+        self.goal_state = jnp.array(goal_state)
         self.modelparams = modelparams
         self.graddynamics = graddynamics if graddynamics is not None else linearize(dynamics)
         self.hessiandynamics = hessiandynamics if hessiandynamics is not None else quadratize(dynamics)

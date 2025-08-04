@@ -4,6 +4,8 @@ from functools import partial
 import time
 from topoc.utils import *
 
+# Define a goal state
+xg = jnp.array([0.0, 0.0])
 # Example state and input
 x = jnp.array([1.0, 2.0])
 u = jnp.array([0.5, -1.0])
@@ -13,10 +15,12 @@ P = jnp.array([[1.0, 0.0], [0.0, 1.0]])
 Q = jnp.array([[1.0, 0.0], [0.0, 1.0]])
 R = jnp.array([[0.0, 0.0], [0.0, 0.0]])
 
-params = {"P": P}
-terminalcost = partial(quadratic_terminal_cost, params=params)
-params = {"Q": Q, "R": R}
-runningcost = partial(quadratic_running_cost, params=params)
+params_terminal = {"P": P}
+params_running = {"Q": Q, "R": R}
+
+# Include goal state in cost definitions using partial
+terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
+runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
 
 # Warm-up (important for JIT)
 _ = runningcost(x, u)
@@ -35,8 +39,9 @@ print(f"Terminal cost computation time: {end - start:.8f} seconds")
 
 print("State x:", x)
 print("Input u:", u)
-print("Quadratic running cost (with baked-in Q, R):", rcost)
-print("Quadratic terminal cost (with baked-in P):", tcost)
+print("Goal state xg:", xg)
+print("Quadratic running cost (with baked-in Q, R, xg):", rcost)
+print("Quadratic terminal cost (with baked-in P, xg):", tcost)
 
 # --- Linearization (Jacobian) ---
 linearized_runningcost = linearize(runningcost)

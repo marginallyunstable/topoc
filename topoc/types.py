@@ -101,6 +101,21 @@ class WaypointDerivatives(NamedTuple):
     lux: Array # (. , Nu, Nx)
     luu: Array # (. , Nu, Nu)
 
+TRAJ_TO_WAYPOINT_RENAME_MAP = {
+    'fxs': 'fx',
+    'fus': 'fu',
+    'fxxs': 'fxx',
+    'fxus': 'fxu',
+    'fuxs': 'fux',
+    'fuus': 'fuu',
+    'lxs': 'lx',
+    'lus': 'lu',
+    'lxxs': 'lxx',
+    'lxus': 'lxu',
+    'luxs': 'lux',
+    'luus': 'luu',
+}
+
 class NextTimeStepVFDerivatives(NamedTuple): # Next Time Step Value Function Derivatives
     Vx: Array # (Nx,)
     Vxx: Array # (Nx, Nx)
