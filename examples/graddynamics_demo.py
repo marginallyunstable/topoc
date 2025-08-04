@@ -1,4 +1,4 @@
-from models.block.block import block_on_ground_with_friction
+from models.block import block_on_ground_with_friction
 from topoc.utils import linearize, quadratize
 from functools import partial
 import jax
@@ -6,7 +6,8 @@ import jax.numpy as jnp
 import time
 
 params = {"m": 1.0, "g": 9.81, "mu": 0.8, "dt": 0.01}
-dyn = partial(block_on_ground_with_friction, params=params)
+# dyn = partial(block_on_ground_with_friction, params=params)
+dyn = partial(block_on_ground_with_friction, params=None)
 
 # Example state and input
 x = jnp.array([1.0, 2.0])

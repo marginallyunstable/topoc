@@ -177,7 +177,7 @@ def forward_pass(
         new_Xs = jnp.vstack([Xs[0], new_Xs])
         return (new_Xs, new_Us), total_cost
 
-@jax.jit
+@partial(jax.jit, static_argnums=2)
 def backward_pass(
     trajderivatives: TrajDerivatives,
     reg: float = 0.0, # Regularization term for Quu
@@ -274,10 +274,10 @@ def backward_pass(
 
     # Unpack and reverse outputs to forward-time order
     K_seq_rev, k_seq_rev, Vx_seq_rev, Vxx_seq_rev = scan_outputs
-    K_seq = K_seq_rev[::-1]
-    k_seq = k_seq_rev[::-1]
-    Vx_seq = jnp.concatenate([Vx_seq_rev[::-1], lfx[None, :]], axis=0)
-    Vxx_seq = jnp.concatenate([Vxx_seq_rev[::-1], lfxx[None, :, :]], axis=0)
+    K_seq = K_seq_rev
+    k_seq = k_seq_rev
+    Vx_seq = jnp.concatenate([Vx_seq_rev, lfx[None, :]], axis=0)
+    Vxx_seq = jnp.concatenate([Vxx_seq_rev, lfxx[None, :, :]], axis=0)
 
     return dV, success, K_seq, k_seq, Vx_seq, Vxx_seq
 
@@ -433,8 +433,8 @@ def forward_iteration(
 
     # Initial values
     eps_ini = 1.0
-    Xs_ini = jnp.zeros_like(Xs)
-    Us_ini = jnp.zeros_like(Us)
+    Xs_ini = Xs
+    Us_ini = Us
     V_ini = 0.0
     done_ini = False
 

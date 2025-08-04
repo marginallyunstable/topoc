@@ -35,6 +35,7 @@ HessianDynamicsFn = Callable[
 # region: TOAlgorithm Parameters
 
 class AlgorithmName(Enum):
+    DDP = "DDP: Vanilla DDP"
     RDDP1 = "RDDP1: Randomized DDP with Smoothing in state and control space"
     RDDP2 = "RDDP2: Randomized DDP with Smoothing only in control space"
     SPDDP = "SPDDP: Sigma Point Differential Dynamic Programming"
@@ -43,6 +44,12 @@ class AlgorithmName(Enum):
 class AlgorithmParams:
     """Namespace for all algorithm parameter classes."""
 
+    class DDPParams:
+        def __init__(self, beta: float, gamma: float, use_second_order_info: bool = False):
+            self.beta = beta
+            self.gamma = gamma
+            self.use_second_order_info = use_second_order_info
+    
     class RDDP1Params:
         def __init__(self, alpha: float, beta: int):
             self.alpha = alpha
@@ -61,6 +68,7 @@ class AlgorithmParams:
 
 # Mapping from AlgorithmName to parameter class
 algorithm_param_classes = {
+    AlgorithmName.DDP: AlgorithmParams.DDPParams,
     AlgorithmName.RDDP1: AlgorithmParams.RDDP1Params,
     AlgorithmName.RDDP2: AlgorithmParams.RDDP2Params,
     AlgorithmName.SPDDP: AlgorithmParams.SPDDPParams,

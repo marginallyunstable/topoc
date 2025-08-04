@@ -10,6 +10,7 @@ from enum import Enum
 
 from topoc.utils import linearize, quadratize
 from topoc.types import *
+from topoc.ddp import DDP
 
 class TOSolve:
     """
@@ -24,14 +25,9 @@ class TOSolve:
     def _solve(self):
         # Dispatch to the correct solver based on algorithm type
         # Replace with your actual solver logic
-        if self.algorithm.algo_type == AlgorithmName.RDDP1:
-            return self._rddp1_solver()
-        elif self.algorithm.algo_type == AlgorithmName.RDDP2:
-            return self._rddp2_solver()
-        elif self.algorithm.algo_type == AlgorithmName.SPDDP:
-            return self._spddp_solver()
-        elif self.algorithm.algo_type == AlgorithmName.SPPDP:
-            return self._sppdp_solver()
+        if self.algorithm.algo_type == AlgorithmName.DDP:
+            ddp = DDP(self.problem, self.algorithm)
+            return ddp.solve()
         else:
             raise ValueError(f"Unknown algorithm: {self.algorithm.algo_type}")
 

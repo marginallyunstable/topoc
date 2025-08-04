@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
-from models.block.block import block_on_ground
+from models.block import block_on_ground
 from topoc.utils import backward_pass, forward_pass, forward_iteration, traj_batch_derivatives, linearize, quadratize
 import time
 import jax.profiler
