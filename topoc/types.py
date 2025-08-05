@@ -42,21 +42,77 @@ class AlgorithmName(Enum):
     SPPDP = "SPPDP: Sigma Point Probabilistic Dynamic Programming"
 
 class AlgorithmParams:
-    """Namespace for all algorithm parameter classes."""
+    """
+    Namespace for all algorithm parameter classes.
+        Common parameters for all algorithms:
+            beta: regularization reduction parameter
+            gamma: scaling(reduction) factor for dV 
+            use_second_order_info: whether to use second order information in the algorithm
+            max_iters: maximum number of iterations for the algorithm
+            max_fi_iters: maximum number of backtracking steps for forward iteration
+            stopping criteria: if this change in value function is reached, the algorithm stops
+    """
+
+    
 
     class DDPParams:
-        def __init__(self, beta: float, gamma: float, use_second_order_info: bool = False):
+        def __init__(self,
+                     beta: float = 0.5,
+                     gamma: float = 0.01,
+                     use_second_order_info: bool = False,
+                     max_iters: int = 200,
+                     max_fi_iters: int = 50,
+                     stopping_criteria: float = 1e-6):
             self.beta = beta
             self.gamma = gamma
             self.use_second_order_info = use_second_order_info
-    
+            self.max_iters = max_iters
+            self.max_fi_iters = max_fi_iters
+            self.stopping_criteria = stopping_criteria
+
     class RDDP1Params:
         def __init__(self, alpha: float, beta: int):
             self.alpha = alpha
             self.beta = beta
     class RDDP2Params:
-        def __init__(self, gamma: float):
+        """
+        RDDP2 Parameters
+            alpha: with this change in value function perform next DDP iteration with reduced noise
+            alpha_red: reduction factor for alpha for next iteration
+            sigma: initial noise for control space
+            sigma_red: reduction factor for sigma for next iteration
+            targetalpha: target value for alpha to stop the algorithm
+            targetsigma: target value for sigma to stop the algorithm
+            mcsamples: number of samples for Monte Carlo estimation
+        """
+        def __init__(self,
+                     beta: float = 0.5,
+                     gamma: float = 0.01,
+                     use_second_order_info: bool = False,
+                     max_iters: int = 200,
+                     max_fi_iters: int = 50,
+                     stopping_criteria: float = 1e-6,
+                     # RDDP2 specific parameters
+                     alpha: float = 10, # change in value function
+                     alpha_red: float = 2.0,
+                     sigma: float = 2.0,
+                     sigma_red: float = 2.0,
+                     targetalpha: float = 1e-6,
+                     targetsigma: float = 1e-6,
+                     mcsamples: int = 50):
+            self.beta = beta
             self.gamma = gamma
+            self.use_second_order_info = use_second_order_info
+            self.max_iters = max_iters
+            self.max_fi_iters = max_fi_iters
+            self.stopping_criteria = stopping_criteria
+            self.alpha = alpha
+            self.alpha_red = alpha_red
+            self.sigma = sigma
+            self.sigma_red = sigma_red
+            self.targetalpha = targetalpha  
+            self.targetsigma = targetsigma
+            self.mcsamples = mcsamples
 
     class SPDDPParams:
         def __init__(self, delta: float):

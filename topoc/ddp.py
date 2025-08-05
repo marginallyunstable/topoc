@@ -1,6 +1,5 @@
-"""DDP algorithm Skeleton"""
-
 from typing import NamedTuple, Callable, Optional, Tuple, Any, TYPE_CHECKING
+from collections import namedtuple
 from functools import partial
 from jax import Array
 import jax
@@ -51,6 +50,7 @@ class DDP():
 
         while True:
 
+            iter += 1
             print(f"Iteration: {iter}")
 
             # region: Backward Pass
@@ -75,23 +75,23 @@ class DDP():
             Vprev = Vbar # Store previous value to check post forward iteration
 
             xbar, ubar, Vbar, eps, done = forward_iteration(
-                xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_iters=20
+                xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
             )
 
             if not done:
-                print("Line Search exhaused. Try playing with gamma/beta/max_iters.")
-                break
+                    Vstore.append(Vprev)
+                    print(f"Line Search exhausted. Try playing with gamma/beta/max_iters. dV value being used: {dV}")
+                    break
 
             Vstore.append(Vbar)
             Change = Vprev - Vbar
 
-            iter += 1
+            if Change < self.toalgorithm.params.stopping_criteria or iter > self.toalgorithm.params.max_iters:
+                    print(f"Converged in {iter} iteration(s).")
+                    break
 
-            if Change < 1e-6 or iter > 100:
-                print(f"Converged in {iter} iterations.")
-                break
-
-        return xbar, ubar, Vstore
+        Result = namedtuple('Result', ['xbar', 'ubar', 'Vstore'])
+        return Result(xbar=xbar, ubar=ubar, Vstore=Vstore)
 
 
                 

@@ -7,6 +7,11 @@ from jax import Array, lax, debug, profiler
 import jax.numpy as jnp
 import functools
 from functools import partial
+
+import matplotlib as mpl
+from matplotlib.collections import LineCollection
+import matplotlib.pyplot as plt
+
 import time
 
 from topoc.types import *
@@ -328,13 +333,13 @@ def traj_batch_derivatives(
 
 
 # region: Smoothed Trajectory Derivatives
-@partial(jax.jit, static_argnums=(2, 4, 5, 6))
+@partial(jax.jit, static_argnums=(2, 4))
 def smoothed_traj_batch_derivatives(
     Xs,  # (N, Nx)
     Us,  # (N-1, Nu)
     toproblem: "TOProblemDefinition",
     sigma: float = 1e-3,
-    N_samples: int = 1000,
+    N_samples: int = 50,
     seed: int = 0,
     key: jax.Array = None,
 ):
@@ -445,7 +450,7 @@ def smoothed_dynamics_derivatives(
     fx_diff = (fx_plus - fx_minus) / (2 * C)  # [N, Nx, Nx]
     # fux: [Nx, Nu, Nx]
     # [N, Nx, Nx] and [N, Nu] -> [Nx, Nu, Nx]
-    fux_s = jnp.einsum('nij,ni->jin', fx_diff, eps) / N
+    fux_s = jnp.einsum('nij,nk->ikj', fx_diff, eps) / N
 
     return fx_s, fxx_s, fu_s, fux_s, fuu_s
 
@@ -490,7 +495,7 @@ def forward_iteration(
     dV,
     toproblem: "TOProblemDefinition",
     algorithm: "TOAlgorithm",
-    max_iters: int = 50,  # Maximum number of backtracking steps
+    max_fi_iters,  # Maximum number of backtracking steps
 ):
     """
     JIT-compatible line search with backtracking for DDP/iLQR forward pass.
@@ -525,35 +530,22 @@ def forward_iteration(
         eps, V, Xs_new, Us_new, done = scanstate
 
         def do_update(_):
-            print("Starting forward_pass...")  # Changed from forward_pass_jit
-            start_fp = time.time()
             (Xs_new1, Us_new1), V1 = forward_pass(
                 Xs, Us, Ks, ks, toproblem, eps
             )
-            end_fp = time.time()
-            print(f"forward_pass took {end_fp - start_fp:.8f} seconds")
-
-            print("Evaluating acceptance condition...")
-            start_cond = time.time()
             accept = V1 < Vprev + gamma * eps * (1 - eps / 2) * dV
             new_eps = lax.select(accept, eps, beta * eps)
             new_done = done | accept
             Xs_out = lax.select(accept, Xs_new1, Xs_new)
             Us_out = lax.select(accept, Us_new1, Us_new)
             V_out = lax.select(accept, V1, V)
-            end_cond = time.time()
-            print(f"Acceptance condition evaluation took {end_cond - start_cond:.8f} seconds")
 
             return (new_eps, V_out, Xs_out, Us_out, new_done), None
 
         def do_nothing(_): # Latch the state
             return (eps, V, Xs_new, Us_new, done), None
 
-        print("Checking done condition...")
-        start_done = time.time()
         result = lax.cond(done, do_nothing, do_update, operand=None)
-        end_done = time.time()
-        print(f"Done condition check took {end_done - start_done:.8f} seconds")
 
         return result
 
@@ -561,21 +553,376 @@ def forward_iteration(
     eps_ini = 1.0
     Xs_ini = Xs
     Us_ini = Us
-    V_ini = 0.0
+    # V_ini = 0.0
+    V_ini = Vprev
     done_ini = False
 
     scanstate = (eps_ini, V_ini, Xs_ini, Us_ini, done_ini)
-    print("Starting lax.scan...")
-    start_scan = time.time()
-    finalscanstate, _ = lax.scan(body_fn, scanstate, xs=None, length=max_iters)
+    finalscanstate, _ = lax.scan(body_fn, scanstate, xs=None, length=max_fi_iters)
     
 
     eps, V, Xs_new, Us_new, done = finalscanstate
-
-    end_scan = time.time()
-    print(f"lax.scan took {end_scan - start_scan:.8f} seconds")
 
     return Xs_new, Us_new, V, eps, done
 
 
 # endregion: Functions for Algorithms
+
+
+# region: Plotting Functions
+
+def plot_block_results(result, x0, xg, modelparams):
+    """
+    Plot block optimization results with three subplots:
+    1. Position vs Velocity (phase plot, colored by time)
+    2. Input vs Time (colored by time)
+    3. Vstore vs Iterations (colored from red to green as values decrease)
+    result: object with attributes xbar, ubar, Vstore
+    x0: (2,) initial state
+    xg: (2,) goal state
+    modelparams: ModelParams object (for dt and horizon_len)
+    """
+    import numpy as np
+    plt.style.use('seaborn-v0_8-darkgrid')
+    mpl.rcParams.update({
+        "font.size": 16,
+        "axes.labelsize": 18,
+        "axes.titlesize": 20,
+        "legend.fontsize": 14,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+        "figure.figsize": (18, 6),
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.linewidth": 1.2,
+        "grid.alpha": 0.3,
+        "lines.linewidth": 2.5,
+    })
+
+    xbar = np.asarray(result.xbar)
+    ubar = np.asarray(result.ubar)
+    Vstore = np.asarray(result.Vstore)
+    dt = modelparams.dt
+    H = modelparams.horizon_len
+    positions = xbar[:, 0]
+    velocities = xbar[:, 1]
+    timesteps = np.arange(len(positions))
+    times = timesteps * dt
+
+    fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+
+    # 1. Phase plot: position vs velocity
+    ax = axs[0]
+    points = np.stack([positions, velocities], axis=1).reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    norm = plt.Normalize(times[0], times[-1])
+    lc = LineCollection(segments, cmap='viridis', norm=norm)
+    lc.set_array(times)
+    lc.set_linewidth(3)
+    line = ax.add_collection(lc)
+    ax.scatter(x0[0], x0[1], color='#43a047', s=100, marker='o', label='Start', zorder=3)
+    ax.scatter(xg[0], xg[1], color='#e53935', s=100, marker='*', label='Goal', zorder=3)
+    ax.set_xlabel('Position (m)')
+    ax.set_ylabel('Velocity (m/s)')
+    ax.set_title('State Trajectory')
+    ax.legend(loc='best', frameon=True)
+    ax.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax.set_axisbelow(True)
+    cbar = plt.colorbar(line, ax=ax, pad=0.02)
+    cbar.set_label(f'Time (s) [Horizon: {H}]')
+
+
+    # 2. Input vs time
+    ax2 = axs[1]
+    input_times = np.arange(len(ubar)) * dt
+    uvals = ubar[:, 0] if ubar.ndim > 1 else ubar
+    points_u = np.stack([input_times, uvals], axis=1).reshape(-1, 1, 2)
+    segments_u = np.concatenate([points_u[:-1], points_u[1:]], axis=1)
+    norm_u = plt.Normalize(input_times[0], input_times[-1])
+    lc_u = LineCollection(segments_u, cmap='viridis', norm=norm_u)
+    lc_u.set_array(input_times[:-1])
+    lc_u.set_linewidth(3)
+    line_u = ax2.add_collection(lc_u)
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Input (u)')
+    ax2.set_title('Input Trajectory')
+    ax2.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax2.set_axisbelow(True)
+    ax2.set_xlim(input_times[0], input_times[-1])
+    ax2.set_ylim(uvals.min() - 0.1 * abs(uvals.min()), uvals.max() + 0.1 * abs(uvals.max()))
+    # Remove colorbar and y-axis label for time in input subplot
+
+
+    # 3. Vstore vs iterations
+    ax3 = axs[2]
+    iterations = np.arange(len(Vstore))
+    # Color from red (high) to green (low) -- reverse colormap so high=red, low=green
+    from matplotlib.colors import LinearSegmentedColormap
+    red_green = LinearSegmentedColormap.from_list('red_green', ['#43a047', '#e53935'])
+    # For correct color mapping, use Vstore[:-1] for segments
+    norm_v = plt.Normalize(Vstore.min(), Vstore.max())
+    points_v = np.stack([iterations, Vstore], axis=1).reshape(-1, 1, 2)
+    segments_v = np.concatenate([points_v[:-1], points_v[1:]], axis=1)
+    # Color by Vstore value at start of each segment
+    lc_v = LineCollection(segments_v, cmap=red_green, norm=norm_v)
+    lc_v.set_array(Vstore[:-1])
+    lc_v.set_linewidth(3)
+    line_v = ax3.add_collection(lc_v)
+    ax3.set_xlabel('Iteration')
+    ax3.set_ylabel('Cost (Vstore)')
+    ax3.set_title('Cost vs Iteration (Log Scale)')
+    ax3.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax3.set_axisbelow(True)
+    ax3.set_xlim(iterations[0], iterations[-1])
+    ax3.set_yscale('log')
+    # Set y-limits for log scale, avoid log(0)
+    vmin = np.clip(Vstore.min(), 1e-12, None)
+    vmax = Vstore.max()
+    ax3.set_ylim(vmin, vmax * 1.05)
+    cbar3 = plt.colorbar(line_v, ax=ax3, pad=0.02)
+    cbar3.set_label('Cost (Vstore)')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_pendulum_results(result, x0, xg, modelparams):
+    """
+    Plot pendulum optimization results with three subplots:
+    1. Angular Position vs Angular Velocity (phase plot, colored by time)
+    2. Input vs Time (colored by time)
+    3. Vstore vs Iterations (colored from red to green as values decrease)
+    result: object with attributes xbar, ubar, Vstore
+    x0: (2,) initial state (angle, angular velocity)
+    xg: (2,) goal state (angle, angular velocity)
+    modelparams: ModelParams object (for dt and horizon_len)
+    """
+    import numpy as np
+    plt.style.use('seaborn-v0_8-darkgrid')
+    mpl.rcParams.update({
+        "font.size": 16,
+        "axes.labelsize": 18,
+        "axes.titlesize": 20,
+        "legend.fontsize": 14,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+        "figure.figsize": (18, 6),
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.linewidth": 1.2,
+        "grid.alpha": 0.3,
+        "lines.linewidth": 2.5,
+    })
+
+    xbar = np.asarray(result.xbar)
+    ubar = np.asarray(result.ubar)
+    Vstore = np.asarray(result.Vstore)
+    dt = modelparams.dt
+    H = modelparams.horizon_len
+    angles = xbar[:, 0]
+    ang_vels = xbar[:, 1]
+    timesteps = np.arange(len(angles))
+    times = timesteps * dt
+
+    fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+
+    # 1. Phase plot: angular position vs angular velocity
+    ax = axs[0]
+    points = np.stack([angles, ang_vels], axis=1).reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    norm = plt.Normalize(times[0], times[-1])
+    lc = LineCollection(segments, cmap='viridis', norm=norm)
+    lc.set_array(times)
+    lc.set_linewidth(3)
+    line = ax.add_collection(lc)
+    ax.scatter(x0[0], x0[1], color='#43a047', s=100, marker='o', label='Start', zorder=3)
+    ax.scatter(xg[0], xg[1], color='#e53935', s=100, marker='*', label='Goal', zorder=3)
+    ax.set_xlabel('Angle (rad)')
+    ax.set_ylabel('Angular Velocity (rad/s)')
+    ax.set_title('Pendulum: State Trajectory')
+    ax.legend(loc='best', frameon=True)
+    ax.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax.set_axisbelow(True)
+    cbar = plt.colorbar(line, ax=ax, pad=0.02)
+    cbar.set_label(f'Time (s) [Horizon: {H}]')
+
+    # 2. Input vs time
+    ax2 = axs[1]
+    input_times = np.arange(len(ubar)) * dt
+    uvals = ubar[:, 0] if ubar.ndim > 1 else ubar
+    points_u = np.stack([input_times, uvals], axis=1).reshape(-1, 1, 2)
+    segments_u = np.concatenate([points_u[:-1], points_u[1:]], axis=1)
+    norm_u = plt.Normalize(input_times[0], input_times[-1])
+    lc_u = LineCollection(segments_u, cmap='viridis', norm=norm_u)
+    lc_u.set_array(input_times[:-1])
+    lc_u.set_linewidth(3)
+    line_u = ax2.add_collection(lc_u)
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Input (u)')
+    ax2.set_title('Input Trajectory')
+    ax2.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax2.set_axisbelow(True)
+    ax2.set_xlim(input_times[0], input_times[-1])
+    ax2.set_ylim(uvals.min() - 0.1 * abs(uvals.min()), uvals.max() + 0.1 * abs(uvals.max()))
+    # Remove colorbar and y-axis label for time in input subplot
+
+    # 3. Vstore vs iterations
+    ax3 = axs[2]
+    iterations = np.arange(len(Vstore))
+    from matplotlib.colors import LinearSegmentedColormap
+    red_green = LinearSegmentedColormap.from_list('red_green', ['#43a047', '#e53935'])
+    norm_v = plt.Normalize(Vstore.min(), Vstore.max())
+    points_v = np.stack([iterations, Vstore], axis=1).reshape(-1, 1, 2)
+    segments_v = np.concatenate([points_v[:-1], points_v[1:]], axis=1)
+    lc_v = LineCollection(segments_v, cmap=red_green, norm=norm_v)
+    lc_v.set_array(Vstore[:-1])
+    lc_v.set_linewidth(3)
+    line_v = ax3.add_collection(lc_v)
+    ax3.set_xlabel('Iteration')
+    ax3.set_ylabel('Cost (Vstore)')
+    ax3.set_title('Cost vs Iteration (Log Scale)')
+    ax3.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax3.set_axisbelow(True)
+    ax3.set_xlim(iterations[0], iterations[-1])
+    ax3.set_yscale('log')
+    vmin = np.clip(Vstore.min(), 1e-12, None)
+    vmax = Vstore.max()
+    ax3.set_ylim(vmin, vmax * 1.05)
+    cbar3 = plt.colorbar(line_v, ax=ax3, pad=0.02)
+    cbar3.set_label('Cost (Vstore)')
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_cartpole_results(result, x0, xg, modelparams):
+    """
+    Plot cartpole optimization results with four subplots (2x2 grid):
+    (1,1): Position vs Velocity (colored by time)
+    (2,1): Angular Position vs Angular Velocity (colored by time)
+    (1,2): Input vs Time
+    (2,2): Vstore vs Iterations (log scale, red to green)
+    result: object with attributes xbar, ubar, Vstore
+    x0: (4,) initial state (pos, vel, angpos, angvel)
+    xg: (4,) goal state (pos, vel, angpos, angvel)
+    modelparams: ModelParams object (for dt and horizon_len)
+    """
+    import numpy as np
+    plt.style.use('seaborn-v0_8-darkgrid')
+    mpl.rcParams.update({
+        "font.size": 16,
+        "axes.labelsize": 18,
+        "axes.titlesize": 20,
+        "legend.fontsize": 14,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+        "figure.figsize": (14, 10),
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.linewidth": 1.2,
+        "grid.alpha": 0.3,
+        "lines.linewidth": 2.5,
+    })
+
+    xbar = np.asarray(result.xbar)
+    ubar = np.asarray(result.ubar)
+    Vstore = np.asarray(result.Vstore)
+    dt = modelparams.dt
+    H = modelparams.horizon_len
+    pos = xbar[:, 0]
+    vel = xbar[:, 1]
+    angpos = xbar[:, 2]
+    angvel = xbar[:, 3]
+    timesteps = np.arange(len(pos))
+    times = timesteps * dt
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+    # (1,1): Position vs Velocity
+    ax = axs[0, 0]
+    points = np.stack([pos, vel], axis=1).reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    norm = plt.Normalize(times[0], times[-1])
+    lc = LineCollection(segments, cmap='viridis', norm=norm)
+    lc.set_array(times)
+    lc.set_linewidth(3)
+    line = ax.add_collection(lc)
+    ax.scatter(x0[0], x0[1], color='#43a047', s=100, marker='o', label='Start', zorder=3)
+    ax.scatter(xg[0], xg[1], color='#e53935', s=100, marker='*', label='Goal', zorder=3)
+    ax.set_xlabel('Position (m)')
+    ax.set_ylabel('Velocity (m/s)')
+    ax.set_title('Cartpole: Position vs Velocity')
+    ax.legend(loc='best', frameon=True)
+    ax.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax.set_axisbelow(True)
+    cbar = plt.colorbar(line, ax=ax, pad=0.02)
+    cbar.set_label(f'Time (s) [Horizon: {H}]')
+
+    # (2,1): Angular Position vs Angular Velocity
+    ax21 = axs[1, 0]
+    points_a = np.stack([angpos, angvel], axis=1).reshape(-1, 1, 2)
+    segments_a = np.concatenate([points_a[:-1], points_a[1:]], axis=1)
+    norm_a = plt.Normalize(times[0], times[-1])
+    lc_a = LineCollection(segments_a, cmap='plasma', norm=norm_a)
+    lc_a.set_array(times)
+    lc_a.set_linewidth(3)
+    line_a = ax21.add_collection(lc_a)
+    ax21.scatter(x0[2], x0[3], color='#43a047', s=100, marker='o', label='Start', zorder=3)
+    ax21.scatter(xg[2], xg[3], color='#e53935', s=100, marker='*', label='Goal', zorder=3)
+    ax21.set_xlabel('Angle (rad)')
+    ax21.set_ylabel('Angular Velocity (rad/s)')
+    ax21.set_title('Cartpole: Angle vs Angular Velocity')
+    ax21.legend(loc='best', frameon=True)
+    ax21.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax21.set_axisbelow(True)
+    cbar_a = plt.colorbar(line_a, ax=ax21, pad=0.02)
+    cbar_a.set_label(f'Time (s) [Horizon: {H}]')
+
+    # (1,2): Input vs Time
+    ax12 = axs[0, 1]
+    input_times = np.arange(len(ubar)) * dt
+    uvals = ubar[:, 0] if ubar.ndim > 1 else ubar
+    points_u = np.stack([input_times, uvals], axis=1).reshape(-1, 1, 2)
+    segments_u = np.concatenate([points_u[:-1], points_u[1:]], axis=1)
+    norm_u = plt.Normalize(input_times[0], input_times[-1])
+    lc_u = LineCollection(segments_u, cmap='viridis', norm=norm_u)
+    lc_u.set_array(input_times[:-1])
+    lc_u.set_linewidth(3)
+    line_u = ax12.add_collection(lc_u)
+    ax12.set_xlabel('Time (s)')
+    ax12.set_ylabel('Input (u)')
+    ax12.set_title('Input Trajectory')
+    ax12.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax12.set_axisbelow(True)
+    ax12.set_xlim(input_times[0], input_times[-1])
+    ax12.set_ylim(uvals.min() - 0.1 * abs(uvals.min()), uvals.max() + 0.1 * abs(uvals.max()))
+    # No colorbar for input subplot
+
+    # (2,2): Vstore vs Iterations
+    ax22 = axs[1, 1]
+    iterations = np.arange(len(Vstore))
+    from matplotlib.colors import LinearSegmentedColormap
+    red_green = LinearSegmentedColormap.from_list('red_green', ['#43a047', '#e53935'])
+    norm_v = plt.Normalize(Vstore.min(), Vstore.max())
+    points_v = np.stack([iterations, Vstore], axis=1).reshape(-1, 1, 2)
+    segments_v = np.concatenate([points_v[:-1], points_v[1:]], axis=1)
+    lc_v = LineCollection(segments_v, cmap=red_green, norm=norm_v)
+    lc_v.set_array(Vstore[:-1])
+    lc_v.set_linewidth(3)
+    line_v = ax22.add_collection(lc_v)
+    ax22.set_xlabel('Iteration')
+    ax22.set_ylabel('Cost (Vstore)')
+    ax22.set_title('Cost vs Iteration (Log Scale)')
+    ax22.grid(True, which='both', linestyle='--', linewidth=0.7)
+    ax22.set_axisbelow(True)
+    ax22.set_xlim(iterations[0], iterations[-1])
+    ax22.set_yscale('log')
+    vmin = np.clip(Vstore.min(), 1e-12, None)
+    vmax = Vstore.max()
+    ax22.set_ylim(vmin, vmax * 1.05)
+    cbar3 = plt.colorbar(line_v, ax=ax22, pad=0.02)
+    cbar3.set_label('Cost (Vstore)')
+
+    plt.tight_layout()
+    plt.show()
+
+# endregion: Plotting Functions

@@ -3,8 +3,10 @@ import jax.numpy as jnp
 from functools import partial
 from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_block_results
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
-from models.block import block_on_ground 
+from models.block import block_on_ground
 from topoc.types import ModelParams, AlgorithmName
+
+
 
 # Define model parameters (example values)
 state_dim = 2
@@ -33,7 +35,6 @@ params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
 # Define cost functions using partial
-
 dynamics = partial(block_on_ground, params=params_dynamics)
 terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
 runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
@@ -47,18 +48,35 @@ toprob = TOProblemDefinition(
     modelparams=modelparams
 )
 
-# Define algorithm (example: DDP)
-algorithm = TOAlgorithm(AlgorithmName.DDP, gamma=0.01, beta=0.5, use_second_order_info=False)
+# Define RDDP2 algorithm parameters (example values)
+algorithm = TOAlgorithm(
+    AlgorithmName.RDDP2,
+    gamma=0.01,
+    beta=0.5,
+    use_second_order_info=True,
+    sigma=2.0,
+    alpha=0.1,
+    alpha_red=2.0,
+    sigma_red=2.0,
+    targetalpha=1e-6,
+    targetsigma=1e-6,
+    mcsamples=50,
+    max_iters=200,
+    max_fi_iters=50
+)
 
 print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)
 print("Gamma:", algorithm.params.gamma)
 print("Beta:", algorithm.params.beta)
+print("Sigma:", algorithm.params.sigma)
+print("Alpha:", algorithm.params.alpha)
 print("Use second order info:", algorithm.params.use_second_order_info)
 
+# Example usage: create and solve the problem with RDDP2
 tosolve = TOSolve(toprob, algorithm)
 xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
-# Example usage: create and solve the problem with RDDP2
 
 # ---- Call plotting function ----
 plot_block_results(tosolve.result, x0, xg, modelparams)
+

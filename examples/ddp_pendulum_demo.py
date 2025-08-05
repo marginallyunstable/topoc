@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
-from topoc.utils import quadratic_running_cost, quadratic_terminal_cost
+from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_pendulum_results
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
 from models.pendulum import pendulum  # Assumes this exists
 from topoc.types import ModelParams, AlgorithmName
@@ -56,8 +56,9 @@ print("Gamma:", algorithm.params.gamma)
 print("Beta:", algorithm.params.beta)
 print("Use second order info:", algorithm.params.use_second_order_info)
 
-# Example usage: create and solve the problem
-solver = TOSolve(toprob, algorithm)
-print("Solver result:", solver.result)
-# solver.visualize()
-# solver.show_log()
+tosolve = TOSolve(toprob, algorithm)
+xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
+
+# ---- Call plotting function ----
+plot_pendulum_results(tosolve.result, x0, xg, modelparams)
+
