@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from functools import partial
 from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_cartpole_results
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
-from models.cartpole import cartpole  # Assumes this exists
+from models.cartpole import cartpole, cartpole_with_friction  # Assumes this exists
 from topoc.types import ModelParams, AlgorithmName
 
 # Define model parameters (example values)

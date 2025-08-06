@@ -183,7 +183,7 @@ def forward_pass(
         new_Xs = jnp.vstack([Xs[0], new_Xs])
         return (new_Xs, new_Us), total_cost
 
-@partial(jax.jit, static_argnums=2)
+# @partial(jax.jit, static_argnums=2)
 def backward_pass(
     trajderivatives: TrajDerivatives,
     reg: float = 0.0, # Regularization term for Quu
@@ -334,7 +334,7 @@ def traj_batch_derivatives(
 
 # region: Smoothed Trajectory Derivatives
 @partial(jax.jit, static_argnums=(2, 4))
-def smoothed_traj_batch_derivatives(
+def input_smoothed_traj_batch_derivatives(
     Xs,  # (N, Nx)
     Us,  # (N-1, Nu)
     toproblem: "TOProblemDefinition",
@@ -344,7 +344,7 @@ def smoothed_traj_batch_derivatives(
     key: jax.Array = None,
 ):
     """
-    Compute all derivatives for a trajectory using smoothed_dynamics_derivatives for dynamics part.
+    Compute all derivatives for a trajectory using input_smoothed_dynamics_derivatives for dynamics part.
     Returns:
         TrajDerivatives object with attributes:
             fx, fu: (N-1, Nx, Nx), (N-1, Nx, Nu)
@@ -368,10 +368,10 @@ def smoothed_traj_batch_derivatives(
     fx = jax.jacrev(f, argnums=0)
     fxx = jax.hessian(f, argnums=0)
 
-    # For each (x, u), call smoothed_dynamics_derivatives with a split key
+    # For each (x, u), call input_smoothed_dynamics_derivatives with a split key
     def smoothed_dyn_for_t(args):
         x, u, key = args
-        return smoothed_dynamics_derivatives(x, u, f, fx, fxx, key, sigma, N_samples)
+        return input_smoothed_dynamics_derivatives(x, u, f, fx, fxx, key, sigma, N_samples)
 
     # Split key for each time step
     keys = random.split(key, Us.shape[0])
@@ -395,7 +395,7 @@ def smoothed_traj_batch_derivatives(
     )
 # endregion: Smoothed Trajectory Derivatives
 
-def smoothed_dynamics_derivatives(
+def input_smoothed_dynamics_derivatives(
     x,
     u,
     f,
@@ -455,6 +455,130 @@ def smoothed_dynamics_derivatives(
     return fx_s, fxx_s, fu_s, fux_s, fuu_s
 
 
+# region: Smoothed Trajectory Derivatives
+@partial(jax.jit, static_argnums=(2, 5))
+def state_input_smoothed_traj_batch_derivatives(
+    Xs,  # (N, Nx)
+    Us,  # (N-1, Nu)
+    toproblem: "TOProblemDefinition",
+    sigma_x: float = 1e-4,
+    sigma_u: float = 1e-3,
+    N_samples: int = 50,
+    seed: int = 0,
+    key: jax.Array = None,
+):
+    """
+    Compute all derivatives for a trajectory using state_input_smoothed_dynamics_derivatives for dynamics part.
+    Returns:
+        TrajDerivatives object with attributes:
+            fx, fu: (N-1, Nx, Nx), (N-1, Nx, Nu)
+            fxx, fxu, fux, fuu: (N-1, Nx, Nx, Nx), (N-1, Nx, Nx, Nu), (N-1, Nx, Nu, Nx), (N-1, Nx, Nu, Nu)
+            lx, lu: (N-1, Nx), (N-1, Nu)
+            lxx, lxu, lux, luu: (N-1, Nx, Nx), (N-1, Nx, Nu), (N-1, Nu, Nx), (N-1, Nu, Nu)
+            lfx: (Nx,)
+            lfxx: (Nx, Nx)
+    """
+    # Use provided key or create from seed
+    if key is None:
+        key = random.PRNGKey(seed)
+    # Get cost derivatives as usual
+    gradrunningcost = toproblem.gradrunningcost
+    hessianrunningcost = toproblem.hessianrunningcost
+    gradterminalcost = toproblem.gradterminalcost
+    hessiantterminalcost = toproblem.hessiantterminalcost
+
+    # Prepare dynamics functions
+    f = toproblem.dynamics
+
+    # For each (x, u), call state_input_smoothed_dynamics_derivatives with a split key
+    def smoothed_dyn_for_t(args):
+        x, u, key = args
+        return state_input_smoothed_dynamics_derivatives(x, u, f, key, sigma_x, sigma_u, N_samples)
+
+    # Split key for each time step
+    keys = random.split(key, Us.shape[0])
+    # Map over time steps
+    fx_s, fxx_s, fu_s, fux_s, fuu_s = jax.vmap(smoothed_dyn_for_t)((Xs[:-1], Us, keys))
+
+    # Cost derivatives as usual
+    lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
+    (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+
+    # Terminal cost on last state (Xs[-1])
+    lfx = gradterminalcost(Xs[-1])
+    lfxx = hessiantterminalcost(Xs[-1])
+
+    return TrajDerivatives(
+        fxs=fx_s, fus=fu_s,
+        fxxs=fxx_s, fxus=None, fuxs=fux_s, fuus=fuu_s,
+        lxs=lxs, lus=lus,
+        lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
+        lfx=lfx, lfxx=lfxx
+    )
+# endregion: Smoothed Trajectory Derivatives
+
+def state_input_smoothed_dynamics_derivatives(
+    x,
+    u,
+    f,
+    key,
+    sigma_x: float = 1e-4,
+    sigma_u: float = 1e-3,
+    N: int = 1000,
+):
+    """
+    JAX/jittable, vectorized version of smoothed_dynamicsInfo.
+    Uses (N, Nx) and (N, Nu) conventions for batching.
+    Returns: fx_s, fxx_s, fu_s, fux_s, fuu_s
+    """
+    C_x = jnp.sqrt(sigma_x)
+    C_u = jnp.sqrt(sigma_u)
+    Nx = x.shape[0]
+    Nu = u.shape[0]
+    C = jnp.concatenate([jnp.full((Nx,), C_x), jnp.full((Nu,), C_u)])
+    C = jnp.diag(C)
+    C_inv = jnp.linalg.inv(C)
+    f0 = f(x, u)  # [Nx]
+
+    # Sample perturbations
+    eps_x = jax.random.normal(key, (N, Nx))
+    x_plus = x + C_x * eps_x  # [N, Nx]
+    x_minus = x - C_x * eps_x  # [N, Nx]
+    eps_u = jax.random.normal(key, (N, Nu))
+    u_plus = u + C_u * eps_u  # [N, Nu]
+    u_minus = u - C_u * eps_u  # [N, Nu]
+    eps = jnp.concatenate([eps_x, eps_u], axis=1)  # [N, Nx + Nu]
+
+    # Vectorized evaluation of f, fx, fxx
+    f_plus = jax.vmap(lambda xp, up: f(xp, up))(x_plus, u_plus)  # [N, Nx]
+    f_minus = jax.vmap(lambda xm, um: f(xm, um))(x_minus, u_minus)  # [N, Nx]
+
+    # # fx, fu
+    # f_diff = (f_plus - f_minus) / (2)  # [N, Nx]
+    # # f_diff = f_plus  # [N, Nx]
+    # # [N, Nx] @ [N, Nu] -> [Nx, Nu]
+    # fz_s = (f_diff.T @ (C_inv @ eps.T).T) / N  # [Nx, Nx+Nu]
+    # fx_s = fz_s[:, :Nx]  # [Nx, Nx]
+    # fu_s = fz_s[:, Nx:]  # [Nx, Nu]
+
+    fx_s, fu_s = calc_AB_lstsq(x_plus, u_plus, f_plus, x, u)
+
+    # fu_s = (f_diff.T @ eps_u) / N / C_u  # [Nx, Nu]
+    # fx_s = (f_diff.T @ eps_x) / N / C_x  # [Nx, Nx]
+
+    # fxx, fux, fuu
+    delta_f = (f_plus + f_minus - 2 * f0)/2  # [N, Nx]
+    # eps_outer: [N, Nx+Nu, Nx+Nu]
+    eps_outer = eps[:, :, None] * eps[:, None, :]  # [N, Nx+Nu, Nx+Nu]
+    eps_outer = eps_outer - jnp.eye(Nx + Nu)[None, :, :]  # [N, Nx+Nu, Nx+Nu]
+    eps_outer_transformed = jax.vmap(lambda e: C_inv @ e @ C_inv)(eps_outer)  # [N, Nx+Nu, Nx+Nu]
+    fzz_s = jnp.einsum('nd,nij->dij', delta_f, eps_outer_transformed) / N  # [Nx, Nx+Nu, Nx+Nu]
+    fxx_s = fzz_s[:, :Nx, :Nx]  # [Nx, Nx, Nx]
+    fux_s = fzz_s[:, Nx:, :Nx]  # [Nx, Nu, Nx]
+    fuu_s = fzz_s[:, Nx:, Nx:]  # [Nu, Nu, Nu]
+
+    return fx_s, fxx_s, fu_s, fux_s, fuu_s
+
 
 def QInfo(
     ctsdinfo: WaypointDerivatives,
@@ -469,6 +593,8 @@ def QInfo(
     lx, lu, lxx, lux, luu = ctsdinfo.lx, ctsdinfo.lu, ctsdinfo.lxx, ctsdinfo.lux, ctsdinfo.luu
     Vx, Vxx = ntsdinfo.Vx, ntsdinfo.Vxx
 
+    # Vxx = Vxx + 1e-3 * jnp.eye(Vxx.shape[0])
+    
     # First-order
     Qx = lx + fx.T @ Vx
     Qu = lu + fu.T @ Vx
@@ -566,6 +692,44 @@ def forward_iteration(
     return Xs_new, Us_new, V, eps, done
 
 
+def calc_AB_lstsq(x_batch, u_batch, x_next_batch, x_nominal, u_nominal):
+    """
+    Estimate A, B from batch data.
+
+    Args:
+        x_batch: (N, n_x) batch of initial states
+        u_batch: (N, n_u) batch of inputs
+        x_next_batch: (N, n_x) batch of next states
+        x_nominal: (n_x,) nominal state
+        u_nominal: (n_u,) nominal input
+    
+    Returns:
+        A: (n_x, n_x) state matrix
+        B: (n_x, n_u) input matrix
+        c: (n_x,) offset (mean of x_next_batch)
+    """
+    N, n_x = x_batch.shape
+    n_u = u_batch.shape[1]
+    
+    # Center data
+    dx = x_batch - x_nominal  # (N, n_x)
+    du = u_batch - u_nominal  # (N, n_u)
+    x_next_mean = jnp.mean(x_next_batch, axis=0)
+    dy = x_next_batch - x_next_mean  # (N, n_x)
+
+    # Stack inputs horizontally: [du | dx]
+    input_mat = jnp.hstack([du, dx])  # (N, n_u + n_x)
+
+    # Solve least squares: dy = input_mat @ [B.T; A.T]
+    BA_T, residuals, rank, s = jnp.linalg.lstsq(input_mat, dy, rcond=None)
+    BA = BA_T.T  # Transpose back to match shape
+    
+    B = BA[:, :n_u]  # first n_u columns
+    A = BA[:, n_u:]  # remaining n_x columns
+
+    return A, B
+
+
 # endregion: Functions for Algorithms
 
 
@@ -660,7 +824,11 @@ def plot_block_results(result, x0, xg, modelparams):
     from matplotlib.colors import LinearSegmentedColormap
     red_green = LinearSegmentedColormap.from_list('red_green', ['#43a047', '#e53935'])
     # For correct color mapping, use Vstore[:-1] for segments
-    norm_v = plt.Normalize(Vstore.min(), Vstore.max())
+    # Use log scale for color normalization
+    vmin = np.clip(Vstore.min(), 1e-12, None)
+    vmax = Vstore.max()
+    from matplotlib.colors import LogNorm
+    norm_v = LogNorm(vmin, vmax)
     points_v = np.stack([iterations, Vstore], axis=1).reshape(-1, 1, 2)
     segments_v = np.concatenate([points_v[:-1], points_v[1:]], axis=1)
     # Color by Vstore value at start of each segment
@@ -676,8 +844,6 @@ def plot_block_results(result, x0, xg, modelparams):
     ax3.set_xlim(iterations[0], iterations[-1])
     ax3.set_yscale('log')
     # Set y-limits for log scale, avoid log(0)
-    vmin = np.clip(Vstore.min(), 1e-12, None)
-    vmax = Vstore.max()
     ax3.set_ylim(vmin, vmax * 1.05)
     cbar3 = plt.colorbar(line_v, ax=ax3, pad=0.02)
     cbar3.set_label('Cost (Vstore)')
@@ -771,7 +937,10 @@ def plot_pendulum_results(result, x0, xg, modelparams):
     iterations = np.arange(len(Vstore))
     from matplotlib.colors import LinearSegmentedColormap
     red_green = LinearSegmentedColormap.from_list('red_green', ['#43a047', '#e53935'])
-    norm_v = plt.Normalize(Vstore.min(), Vstore.max())
+    vmin = np.clip(Vstore.min(), 1e-12, None)
+    vmax = Vstore.max()
+    from matplotlib.colors import LogNorm
+    norm_v = LogNorm(vmin, vmax)
     points_v = np.stack([iterations, Vstore], axis=1).reshape(-1, 1, 2)
     segments_v = np.concatenate([points_v[:-1], points_v[1:]], axis=1)
     lc_v = LineCollection(segments_v, cmap=red_green, norm=norm_v)
@@ -785,8 +954,6 @@ def plot_pendulum_results(result, x0, xg, modelparams):
     ax3.set_axisbelow(True)
     ax3.set_xlim(iterations[0], iterations[-1])
     ax3.set_yscale('log')
-    vmin = np.clip(Vstore.min(), 1e-12, None)
-    vmax = Vstore.max()
     ax3.set_ylim(vmin, vmax * 1.05)
     cbar3 = plt.colorbar(line_v, ax=ax3, pad=0.02)
     cbar3.set_label('Cost (Vstore)')
@@ -857,12 +1024,12 @@ def plot_cartpole_results(result, x0, xg, modelparams):
     cbar = plt.colorbar(line, ax=ax, pad=0.02)
     cbar.set_label(f'Time (s) [Horizon: {H}]')
 
-    # (2,1): Angular Position vs Angular Velocity
-    ax21 = axs[1, 0]
+    # (1,2): Angular Position vs Angular Velocity
+    ax21 = axs[0, 1]
     points_a = np.stack([angpos, angvel], axis=1).reshape(-1, 1, 2)
     segments_a = np.concatenate([points_a[:-1], points_a[1:]], axis=1)
     norm_a = plt.Normalize(times[0], times[-1])
-    lc_a = LineCollection(segments_a, cmap='plasma', norm=norm_a)
+    lc_a = LineCollection(segments_a, cmap='viridis', norm=norm_a) # plasma
     lc_a.set_array(times)
     lc_a.set_linewidth(3)
     line_a = ax21.add_collection(lc_a)
@@ -874,11 +1041,9 @@ def plot_cartpole_results(result, x0, xg, modelparams):
     ax21.legend(loc='best', frameon=True)
     ax21.grid(True, which='both', linestyle='--', linewidth=0.7)
     ax21.set_axisbelow(True)
-    cbar_a = plt.colorbar(line_a, ax=ax21, pad=0.02)
-    cbar_a.set_label(f'Time (s) [Horizon: {H}]')
 
-    # (1,2): Input vs Time
-    ax12 = axs[0, 1]
+    # (2,1): Input vs Time
+    ax12 = axs[1, 0]
     input_times = np.arange(len(ubar)) * dt
     uvals = ubar[:, 0] if ubar.ndim > 1 else ubar
     points_u = np.stack([input_times, uvals], axis=1).reshape(-1, 1, 2)
@@ -902,7 +1067,10 @@ def plot_cartpole_results(result, x0, xg, modelparams):
     iterations = np.arange(len(Vstore))
     from matplotlib.colors import LinearSegmentedColormap
     red_green = LinearSegmentedColormap.from_list('red_green', ['#43a047', '#e53935'])
-    norm_v = plt.Normalize(Vstore.min(), Vstore.max())
+    vmin = np.clip(Vstore.min(), 1e-12, None)
+    vmax = Vstore.max()
+    from matplotlib.colors import LogNorm
+    norm_v = LogNorm(vmin, vmax)
     points_v = np.stack([iterations, Vstore], axis=1).reshape(-1, 1, 2)
     segments_v = np.concatenate([points_v[:-1], points_v[1:]], axis=1)
     lc_v = LineCollection(segments_v, cmap=red_green, norm=norm_v)
@@ -916,8 +1084,6 @@ def plot_cartpole_results(result, x0, xg, modelparams):
     ax22.set_axisbelow(True)
     ax22.set_xlim(iterations[0], iterations[-1])
     ax22.set_yscale('log')
-    vmin = np.clip(Vstore.min(), 1e-12, None)
-    vmax = Vstore.max()
     ax22.set_ylim(vmin, vmax * 1.05)
     cbar3 = plt.colorbar(line_v, ax=ax22, pad=0.02)
     cbar3.set_label('Cost (Vstore)')

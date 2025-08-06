@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 from topoc.types import *
 from topoc.utils import *
 
-class RDDP2():
+class RDDP1():
     """
     Finite horizon Discrete-time Randomized Differential Dynamic Programming(DDP)
     This version uses smoothing only in control space.
@@ -33,7 +33,8 @@ class RDDP2():
         Nx = self.toproblem.modelparams.state_dim
         Nu = self.toproblem.modelparams.input_dim
         H = self.toproblem.modelparams.horizon_len
-        sigma = self.toalgorithm.params.sigma
+        sigma_x = self.toalgorithm.params.sigma_x
+        sigma_u = self.toalgorithm.params.sigma_u
         alpha = self.toalgorithm.params.alpha
 
         # region: Initialize Simulation
@@ -68,9 +69,10 @@ class RDDP2():
 
                 while not success:
 
-                    trajderivatives = input_smoothed_traj_batch_derivatives(
+                    trajderivatives = state_input_smoothed_traj_batch_derivatives(
                         xbar, ubar, self.toproblem,
-                        sigma=sigma,
+                        sigma_x=sigma_x,
+                        sigma_u=sigma_u,
                         N_samples=self.toalgorithm.params.mcsamples,
                         key=jax.random.PRNGKey(42)
                     )
@@ -104,9 +106,11 @@ class RDDP2():
                     print(f"Converged in {iter} iteration(s). [Inner Loop]")
                     break
 
+            # TODO: Change the /100  
             if (
                 (alpha <= self.toalgorithm.params.targetalpha and
-                 sigma <= self.toalgorithm.params.targetsigma)
+                 sigma_x <= self.toalgorithm.params.sigma_x/1e-6 and
+                 sigma_u <= self.toalgorithm.params.sigma_u/1e-6)
                 or iter == self.toalgorithm.params.max_iters
                 or Change <= self.toalgorithm.params.stopping_criteria
             ):
@@ -119,8 +123,10 @@ class RDDP2():
             print(f"Alpha set from {alpha} to {alpha / self.toalgorithm.params.alpha_red}")
             alpha = alpha / self.toalgorithm.params.alpha_red
 
-            print(f"Sigma set from {sigma} to {sigma / self.toalgorithm.params.sigma_red}")
-            sigma = sigma / self.toalgorithm.params.sigma_red
+            print(f"Sigma_x set from {sigma_x} to {sigma_x / self.toalgorithm.params.sigma_red}")
+            sigma_x = sigma_x / self.toalgorithm.params.sigma_red
+            print(f"Sigma_u set from {sigma_u} to {sigma_u / self.toalgorithm.params.sigma_red}")
+            sigma_u = sigma_u / self.toalgorithm.params.sigma_red
 
         Result = namedtuple('Result', ['xbar', 'ubar', 'Vstore'])
         return Result(xbar=xbar, ubar=ubar, Vstore=Vstore)

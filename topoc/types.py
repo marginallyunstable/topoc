@@ -71,9 +71,47 @@ class AlgorithmParams:
             self.stopping_criteria = stopping_criteria
 
     class RDDP1Params:
-        def __init__(self, alpha: float, beta: int):
-            self.alpha = alpha
+        """
+        RDDP1 Parameters
+            alpha: with this change in value function perform next DDP iteration with reduced noise
+            alpha_red: reduction factor for alpha for next iteration
+            sigma_x: initial noise for state space
+            sigma_u: initial noise for control space
+            sigma_red: reduction factor for sigma_x for next iteration
+            targetalpha: target value for alpha to stop the algorithm
+            targetsigma: target value for sigma to stop the algorithm
+            mcsamples: number of samples for Monte Carlo estimation
+        """
+        def __init__(self,
+                     beta: float = 0.5,
+                     gamma: float = 0.01,
+                     use_second_order_info: bool = False,
+                     max_iters: int = 200,
+                     max_fi_iters: int = 50,
+                     stopping_criteria: float = 1e-6,
+                     # RDDP2 specific parameters
+                     alpha: float = 10, # change in value function
+                     alpha_red: float = 2.0,
+                     sigma_x: float = 2.0,
+                     sigma_u: float = 2.0,
+                     sigma_red: float = 2.0,
+                     targetalpha: float = 1e-6,
+                     targetsigma: float = 1e-6,
+                     mcsamples: int = 50):
             self.beta = beta
+            self.gamma = gamma
+            self.use_second_order_info = use_second_order_info
+            self.max_iters = max_iters
+            self.max_fi_iters = max_fi_iters
+            self.stopping_criteria = stopping_criteria
+            self.alpha = alpha
+            self.alpha_red = alpha_red
+            self.sigma_x = sigma_x
+            self.sigma_u = sigma_u
+            self.sigma_red = sigma_red
+            self.targetalpha = targetalpha  
+            self.targetsigma = targetsigma
+            self.mcsamples = mcsamples
     class RDDP2Params:
         """
         RDDP2 Parameters

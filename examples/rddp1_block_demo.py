@@ -48,19 +48,20 @@ toprob = TOProblemDefinition(
     modelparams=modelparams
 )
 
-# Define RDDP2 algorithm parameters (example values)
+# Define RDDP1 algorithm parameters (example values)
 algorithm = TOAlgorithm(
-    AlgorithmName.RDDP2,
+    AlgorithmName.RDDP1,
     gamma=0.01,
     beta=0.5,
-    use_second_order_info=True,
-    sigma=10.0,
+    use_second_order_info=False,
+    sigma_x=0.002,
+    sigma_u=10.0,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=50,
+    mcsamples=200,
     max_iters=200,
     max_fi_iters=50
 )
@@ -69,11 +70,12 @@ print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)
 print("Gamma:", algorithm.params.gamma)
 print("Beta:", algorithm.params.beta)
-print("Sigma:", algorithm.params.sigma)
+print("Sigma_x:", algorithm.params.sigma_x)
+print("Sigma_u:", algorithm.params.sigma_u)
 print("Alpha:", algorithm.params.alpha)
 print("Use second order info:", algorithm.params.use_second_order_info)
 
-# Example usage: create and solve the problem with RDDP2
+# Example usage: create and solve the problem with RDDP1
 tosolve = TOSolve(toprob, algorithm)
 xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
 
