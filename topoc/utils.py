@@ -110,6 +110,16 @@ def quadratic_running_cost(x: Array, u: Array , xg: Array, params: Optional[Any]
     cost = 0.5 * ((x-xg).T @ Q @ (x-xg) + u.T @ R @ u)
     return cost
 
+def quadratic_running_cost_qsim(x: Array, u: Array , xg: Array, params: Optional[Any] = None) -> Array:
+    """
+    Quadratic running cost: 0.5 * (x^T Q x + u^T R u)
+    params should be a dict with 'Q' and 'R' arrays.
+    """
+    Q = params["Q"] if params and "Q" in params else jnp.eye(x.shape[0])
+    R = params["R"] if params and "R" in params else jnp.eye(u.shape[0])
+    cost = 0.5 * ((x-xg).T @ Q @ (x-xg) + (u - x[-2:]).T @ R @ (u - x[-2:]))
+    return cost
+
 def quadratic_terminal_cost(x: Array, xg: Array, params: Optional[Any] = None) -> Array:
     """
     Quadratic terminal cost: 0.5 * (x^T P x)
@@ -394,6 +404,63 @@ def input_smoothed_traj_batch_derivatives(
         lfx=lfx, lfxx=lfxx
     )
 # endregion: Smoothed Trajectory Derivatives
+
+@partial(jax.jit, static_argnums=(2, 4))
+def input_smoothed_traj_batch_derivatives_qsim(
+    Xs,  # (N, Nx)
+    Us,  # (N-1, Nu)
+    toproblem: "TOProblemDefinition",
+    sigma: float = 1e-3,
+    N_samples: int = 50,
+    seed: int = 0,
+    key: jax.Array = None,
+):
+    """
+    Compute all derivatives for a trajectory using input_smoothed_dynamics_derivatives for dynamics part.
+    Returns:
+        TrajDerivatives object with attributes:
+            fx, fu: (N-1, Nx, Nx), (N-1, Nx, Nu)
+            fxx, fxu, fux, fuu: (N-1, Nx, Nx, Nx), (N-1, Nx, Nx, Nu), (N-1, Nx, Nu, Nx), (N-1, Nx, Nu, Nu)
+            lx, lu: (N-1, Nx), (N-1, Nu)
+            lxx, lxu, lux, luu: (N-1, Nx, Nx), (N-1, Nx, Nu), (N-1, Nu, Nx), (N-1, Nu, Nu)
+            lfx: (Nx,)
+            lfxx: (Nx, Nx)
+    """
+    # Use provided key or create from seed
+    if key is None:
+        key = random.PRNGKey(seed)
+    graddynamics = toproblem.graddynamics
+    # Get cost derivatives as usual
+    gradrunningcost = toproblem.gradrunningcost
+    hessianrunningcost = toproblem.hessianrunningcost
+    gradterminalcost = toproblem.gradterminalcost
+    hessiantterminalcost = toproblem.hessiantterminalcost
+
+    fx_s, fu_s = graddynamics(Xs[:-1], Us, jnp.sqrt(sigma), N_samples)
+
+    # Create zeros for higher-order derivatives
+    N = Xs.shape[0]
+    Nx = Xs.shape[1]
+    Nu = Us.shape[1]
+    fxx_s = jnp.zeros((N-1, Nx, Nx, Nx))
+    fux_s = jnp.zeros((N-1, Nx, Nu, Nx))
+    fuu_s = jnp.zeros((N-1, Nx, Nu, Nu))
+
+    # Cost derivatives as usual
+    lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
+    (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+
+    # Terminal cost on last state (Xs[-1])
+    lfx = gradterminalcost(Xs[-1])
+    lfxx = hessiantterminalcost(Xs[-1])
+
+    return TrajDerivatives(
+        fxs=fx_s, fus=fu_s,
+        fxxs=fxx_s, fxus=None, fuxs=fux_s, fuus=fuu_s,
+        lxs=lxs, lus=lus,
+        lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
+        lfx=lfx, lfxx=lfxx
+    )
 
 def input_smoothed_dynamics_derivatives(
     x,
@@ -747,7 +814,8 @@ def plot_block_results(result, x0, xg, modelparams):
     modelparams: ModelParams object (for dt and horizon_len)
     """
     import numpy as np
-    plt.style.use('seaborn-v0_8-darkgrid')
+    # plt.style.use('seaborn-v0_8-darkgrid')
+    plt.style.use('seaborn-darkgrid')
     mpl.rcParams.update({
         "font.size": 16,
         "axes.labelsize": 18,
@@ -864,7 +932,8 @@ def plot_pendulum_results(result, x0, xg, modelparams):
     modelparams: ModelParams object (for dt and horizon_len)
     """
     import numpy as np
-    plt.style.use('seaborn-v0_8-darkgrid')
+    # plt.style.use('seaborn-v0_8-darkgrid')
+    plt.style.use('seaborn-darkgrid')
     mpl.rcParams.update({
         "font.size": 16,
         "axes.labelsize": 18,
@@ -974,7 +1043,8 @@ def plot_cartpole_results(result, x0, xg, modelparams):
     modelparams: ModelParams object (for dt and horizon_len)
     """
     import numpy as np
-    plt.style.use('seaborn-v0_8-darkgrid')
+    # plt.style.use('seaborn-v0_8-darkgrid')
+    plt.style.use('seaborn-darkgrid')
     mpl.rcParams.update({
         "font.size": 16,
         "axes.labelsize": 18,

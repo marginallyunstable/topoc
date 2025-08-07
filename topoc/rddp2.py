@@ -68,12 +68,18 @@ class RDDP2():
 
                 while not success:
 
-                    trajderivatives = input_smoothed_traj_batch_derivatives(
+                    trajderivatives = input_smoothed_traj_batch_derivatives_qsim(
                         xbar, ubar, self.toproblem,
                         sigma=sigma,
                         N_samples=self.toalgorithm.params.mcsamples,
                         key=jax.random.PRNGKey(42)
                     )
+                    # trajderivatives = input_smoothed_traj_batch_derivatives(
+                    #     xbar, ubar, self.toproblem,
+                    #     sigma=sigma,
+                    #     N_samples=self.toalgorithm.params.mcsamples,
+                    #     key=jax.random.PRNGKey(42)
+                    # )
                     dV, success, K, k, Vx, Vxx = backward_pass(trajderivatives,
                                                         regularization,
                                                         use_second_order_info=self.toalgorithm.params.use_second_order_info)
