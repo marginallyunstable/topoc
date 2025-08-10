@@ -12,7 +12,7 @@ from qsim.parser import (
 )
 
 class BoxPushSimulator:
-    def __init__(self, dt=0.05):
+    def __init__(self, dt=0.01):
         q_model_path = os.path.join(models_dir, "q_sys", "box_pushing.yml")
         self.hand_name = "hand"
         self.object_name = "box"

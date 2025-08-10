@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
-from topoc.utils import quadratic_running_cost, quadratic_terminal_cost
+from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, quadratic_running_cost_qsim
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
 from models.qsim_box_push import BoxPushSimulator
 from topoc.types import ModelParams, AlgorithmName
@@ -12,7 +12,7 @@ import os
 # Define model parameters (example values)
 state_dim = 5
 input_dim = 2
-horizon_len = 200
+horizon_len = 100
 dt = 0.01
 
 modelparams = ModelParams(
@@ -24,13 +24,14 @@ modelparams = ModelParams(
 
 # Define initial and goal states
 # State: [box_x, box_y, box_z, hand_x, hand_y] (5 elements total)
-x0 = jnp.array([0.5, 0.5, 0.0, -0.4, 0.0])  # Initial: box and hand at same y position
-xg = jnp.array([1.5, 1.5, 0.0, 0.0, 0.0])  # Goal: push box forward to y=0.9, hand_y=pi/8
+x0 = jnp.array([0.5, 0.5, 0.0, -0.4, 0.5])  # Initial: box and hand at same y position
+xg = jnp.array([0.5, 0.5, 3*jnp.pi/4, 0.0, 0.0])  # Goal: push box forward to y=0.9, hand_y=pi/2
 
 # Define cost matrices
-P = jnp.diag(jnp.array([1000000, 1000000, 1000000, 1, 1]))
-Q = 1*jnp.eye(state_dim)
-R = 1*jnp.eye(input_dim)
+P = jnp.diag(jnp.array([1000000, 1000000, 1000000, 0, 0]))
+Q = jnp.diag(jnp.array([1, 1, 1, 0, 0]))
+# Q = 1*jnp.eye(state_dim)
+R = 10000*jnp.eye(input_dim)
 
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
@@ -45,7 +46,7 @@ def dummy_func(x: jnp.ndarray, u: jnp.ndarray) -> Tuple[Tuple[jnp.ndarray, jnp.n
     return (zeros_x, zeros_u), (zeros_x, zeros_u)
 hessiandynamics = dummy_func  # Placeholder for Hessian dynamics
 terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
-runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
+runningcost = partial(quadratic_running_cost_qsim, xg=xg, params=params_running)
 
 toprob = TOProblemDefinition(
     runningcost=runningcost,
@@ -71,7 +72,7 @@ algorithm = TOAlgorithm(
     targetalpha=1e-6,
     targetsigma=1e-6,
     mcsamples=50,
-    max_iters=5,
+    max_iters=20,
     max_fi_iters=5
 )
 
@@ -128,29 +129,29 @@ import matplotlib.pyplot as plt
 # plt.legend()
 # plt.show()
 
-# # Save results to a txt file in readable format
-# output_file = "/workspace/topoc/examples/rddp2_box_push_results.txt"
-# with open(output_file, "w") as f:
-#     f.write("xbar (state trajectory):\n")
-#     for i, x in enumerate(xbar):
-#         f.write(f"Step {i}: {x.tolist()}\n")
-#     f.write("\nubar (control trajectory):\n")
-#     for i, u in enumerate(ubar):
-#         f.write(f"Step {i}: {u.tolist()}\n")
-#     f.write("\nVstore (value function trajectory):\n")
-#     for i, V in enumerate(Vstore):
-#         f.write(f"Step {i}: {V}\n")
-# print(f"Results saved to {output_file}")
+# Save results to a txt file in readable format
+import json
+output_file = "/workspace/topoc/examples/rddp2_box_push_results.json"
+results_dict = {
+    "xbar": [x.tolist() for x in xbar],
+    "ubar": [u.tolist() for u in ubar],
+    "Vstore": [float(V) for V in Vstore]
+}
+with open(output_file, "w") as f:
+    json.dump(results_dict, f, indent=2)
+print(f"Results saved to {output_file}")
 
 
 
 
-def animate_box_push(xbar, ubar, block_size=1.0, finger_radius=0.1, robot_radius=0.1, dt=0.01, save_path=None):
+def animate_box_push(xbar, ubar, x0, xg, block_size=1.0, finger_radius=0.1, robot_radius=0.1, dt=0.01, save_path=None):
     """
     Animates the box push scene.
     Args:
-        xbar: (N, 5) array, state trajectory [block_x, block_y, block_theta, finger_x, finger_y]
+        xbar: (N, 5) array, state trajectory [block_x, box_y, box_theta, finger_x, finger_y]
         ubar: (N, 2) array, robot command trajectory [robot_x, robot_y]
+        x0: (5,) array, initial state
+        xg: (5,) array, goal state
         block_size: float, size of the block (square side length)
         finger_radius: float, radius of the finger
         robot_radius: float, radius of the robot command
@@ -159,8 +160,8 @@ def animate_box_push(xbar, ubar, block_size=1.0, finger_radius=0.1, robot_radius
     """
     fig, ax = plt.subplots()
     ax.set_aspect('equal')
-    ax.set_xlim(-2.5, 2.5)
-    ax.set_ylim(-2.5, 2.5)
+    ax.set_xlim(-1, 6.5)
+    ax.set_ylim(-1, 6.5)
     ax.set_title("Box Push Animation")
 
     # Block (square)
@@ -174,9 +175,9 @@ def animate_box_push(xbar, ubar, block_size=1.0, finger_radius=0.1, robot_radius
     # Arrow for box orientation
     arrow_patch = ax.arrow(0, 0, 0, 0, head_width=0.07*block_size, head_length=0.12*block_size, fc='k', ec='k')
 
-    # Plot start and goal positions of the box
-    start_x, start_y = xbar[0, 0], xbar[0, 1]
-    goal_x, goal_y = xbar[-1, 0], xbar[-1, 1]
+    # Plot start and goal positions of the box using x0 and xg
+    start_x, start_y = x0[0], x0[1]
+    goal_x, goal_y = xg[0], xg[1]
     start_marker = ax.scatter(start_x, start_y, color='green', s=80, label='Start', zorder=5)
     goal_marker = ax.scatter(goal_x, goal_y, color='orange', s=80, label='Goal', zorder=5)
     ax.legend()
@@ -208,15 +209,27 @@ def animate_box_push(xbar, ubar, block_size=1.0, finger_radius=0.1, robot_radius
 
     def animate(i):
         nonlocal arrow_patch
-        # If i >= xbar.shape[0], just hold the last frame
-        idx = min(i, xbar.shape[0] - 1)
-        bx, by, btheta = xbar[idx, 0], xbar[idx, 1], xbar[idx, 2]
-        fx, fy = xbar[idx, 3], xbar[idx, 4]
-        rx, ry = ubar[idx, 0], ubar[idx, 1]
+        N = xbar.shape[0]
+        # For frames 0 to N-2, use xbar[i], ubar[i]
+        # For frames N-1 and onward, use xbar[N-1], ubar[N-2]
+        if i < N-1:
+            bx, by, btheta = xbar[i, 0], xbar[i, 1], xbar[i, 2]
+            fx, fy = xbar[i, 3], xbar[i, 4]
+            rx, ry = ubar[i, 0], ubar[i, 1]
+        else:
+            bx, by, btheta = xbar[N-1, 0], xbar[N-1, 1], xbar[N-1, 2]
+            fx, fy = xbar[N-1, 3], xbar[N-1, 4]
+            rx, ry = ubar[N-2, 0], ubar[N-2, 1]
         corners = get_block_corners(bx, by, btheta, block_size)
         block_patch.set_data(corners[:, 0], corners[:, 1])
         finger_patch.center = (fx, fy)
-        robot_patch.center = (rx, ry)
+        
+        # Only show robot_patch for frames 0 to N-1
+        if i < N:
+            robot_patch.center = (rx, ry)
+            robot_patch.set_visible(True)
+        else:
+            robot_patch.set_visible(False)
         # Arrow for orientation
         arrow_length = block_size * 0.7
         dx = arrow_length * jnp.cos(btheta)
@@ -266,8 +279,8 @@ script_folder = os.path.dirname(os.path.abspath(__file__))
 
 # Save as GIF
 gif_path = os.path.join(script_folder, "box_push_animation.gif")
-animate_box_push(xbar, ubar, block_size=1, finger_radius=0.2, robot_radius=0.2, dt=dt, save_path=gif_path)
+animate_box_push(xbar, ubar, x0, xg, block_size=1, finger_radius=0.1, robot_radius=0.1, dt=dt, save_path=gif_path)
 
 # Save as MP4 video
 mp4_path = os.path.join(script_folder, "box_push_animation.mp4")
-animate_box_push(xbar, ubar, block_size=1, finger_radius=0.2, robot_radius=0.2, dt=dt, save_path=mp4_path)
+animate_box_push(xbar, ubar, x0, xg, block_size=1, finger_radius=0.1, robot_radius=0.1, dt=dt, save_path=mp4_path)
