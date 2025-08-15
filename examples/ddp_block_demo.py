@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from functools import partial
 from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_block_results
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
-from models.block import block_on_ground 
+from models.block import block_on_ground, block_on_ground_with_friction 
 from topoc.types import ModelParams, AlgorithmName
 
 # Define model parameters (example values)
@@ -21,12 +21,14 @@ modelparams = ModelParams(
 
 # Define initial and goal states
 x0 = jnp.array([0.0, 0.0])
-xg = jnp.array([3.0, 0.0])
+xg = jnp.array([4.0, 0.0])
+# Define initial input (control)
+u0 = jnp.array([0.0])
 
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 0.01*jnp.eye(input_dim)
+R = 5*jnp.eye(input_dim)
 
 params_dynamics = {"m": 1.0, "dt": dt}
 params_terminal = {"P": P}
@@ -43,12 +45,13 @@ toprob = TOProblemDefinition(
     terminalcost=terminalcost,
     dynamics=dynamics,
     starting_state=x0,
+    starting_input=u0,
     goal_state=xg,
     modelparams=modelparams
 )
 
 # Define algorithm (example: DDP)
-algorithm = TOAlgorithm(AlgorithmName.DDP, gamma=0.01, beta=0.5, use_second_order_info=False)
+algorithm = TOAlgorithm(AlgorithmName.DDP, gamma=0.01, beta=0.5, use_second_order_info=True)
 
 print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)
@@ -59,6 +62,8 @@ print("Use second order info:", algorithm.params.use_second_order_info)
 tosolve = TOSolve(toprob, algorithm)
 xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
 # Example usage: create and solve the problem with RDDP2
+
+print(Vstore[-1]) 
 
 # ---- Call plotting function ----
 plot_block_results(tosolve.result, x0, xg, modelparams)

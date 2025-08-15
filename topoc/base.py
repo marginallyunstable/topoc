@@ -74,6 +74,7 @@ class TOProblemDefinition():
         terminalcost: TerminalCostFn,
         dynamics: DynamicsFn,
         starting_state: ArrayLike,
+        starting_input: ArrayLike,
         goal_state: ArrayLike,
         modelparams: ModelParams,
         graddynamics: Optional[GradDynamicsFn] = None,
@@ -101,6 +102,7 @@ class TOProblemDefinition():
         self.terminalcost = terminalcost
         self.dynamics = dynamics
         self.starting_state = jnp.array(starting_state)
+        self.starting_input = jnp.array(starting_input)
         self.goal_state = jnp.array(goal_state)
         self.modelparams = modelparams
         self.graddynamics = graddynamics if graddynamics is not None else linearize(dynamics)

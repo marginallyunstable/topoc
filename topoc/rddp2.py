@@ -30,6 +30,7 @@ class RDDP2():
     def solve(self):
 
         xini = self.toproblem.starting_state
+        uini = self.toproblem.starting_input
         Nx = self.toproblem.modelparams.state_dim
         Nu = self.toproblem.modelparams.input_dim
         H = self.toproblem.modelparams.horizon_len
@@ -40,7 +41,7 @@ class RDDP2():
     
         xbar = jnp.zeros((H, Nx))
         xbar = xbar.at[0].set(xini) # set first element to initial state
-        ubar = jnp.zeros((H-1, Nu))
+        ubar = jnp.tile(uini, (H-1, 1))
         k = jnp.zeros((H-1, Nu))
         K = jnp.zeros((H-1, Nu, Nx))
 
@@ -68,14 +69,20 @@ class RDDP2():
 
                 while not success:
 
+                    # trajderivatives = input_smoothed_traj_batch_derivatives(
+                    #     xbar, ubar, self.toproblem,
+                    #     sigma=sigma,
+                    #     N_samples=self.toalgorithm.params.mcsamples,
+                    #     key=jax.random.PRNGKey(42)
+                    # )
                     trajderivatives = input_smoothed_traj_batch_derivatives_qsim(
                         xbar, ubar, self.toproblem,
                         sigma=sigma,
                         N_samples=self.toalgorithm.params.mcsamples,
                         key=jax.random.PRNGKey(42)
                     )
-                    # trajderivatives = input_smoothed_traj_batch_derivatives(
-                    #     xbar, ubar, self.toproblem,
+                    # trajderivatives = input_smoothed_traj_chunked_batch_derivatives_qsim(
+                    #     xbar, ubar, self.toproblem, chunk_size=5,
                     #     sigma=sigma,
                     #     N_samples=self.toalgorithm.params.mcsamples,
                     #     key=jax.random.PRNGKey(42)

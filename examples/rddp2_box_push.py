@@ -24,11 +24,13 @@ modelparams = ModelParams(
 
 # Define initial and goal states
 # State: [box_x, box_y, box_z, hand_x, hand_y] (5 elements total)
-x0 = jnp.array([0.5, 0.5, 0.0, -0.4, 0.5])  # Initial: box and hand at same y position
-xg = jnp.array([0.5, 0.5, 3*jnp.pi/4, 0.0, 0.0])  # Goal: push box forward to y=0.9, hand_y=pi/2
+x0 = jnp.array([0.5, 0.5, 0.0, -0.4, 0.0])  # Initial: box and hand at same y position
+xg = jnp.array([0.0, 0.5, 0*jnp.pi/4, 0.0, 0.0])  # Goal: push box forward to y=0.9, hand_y=pi/2
+# Define initial input (control)
+u0 = jnp.array([-0.4, 0.0])
 
 # Define cost matrices
-P = jnp.diag(jnp.array([1000000, 1000000, 1000000, 0, 0]))
+P = jnp.diag(jnp.array([1500000, 1500000, 1000000, 0, 0]))
 Q = jnp.diag(jnp.array([1, 1, 1, 0, 0]))
 # Q = 1*jnp.eye(state_dim)
 R = 10000*jnp.eye(input_dim)
@@ -55,6 +57,7 @@ toprob = TOProblemDefinition(
     graddynamics=graddynamics,
     hessiandynamics=hessiandynamics,
     starting_state=x0,
+    starting_input=u0,
     goal_state=xg,
     modelparams=modelparams
 )
@@ -63,7 +66,7 @@ toprob = TOProblemDefinition(
 algorithm = TOAlgorithm(
     AlgorithmName.RDDP2,
     gamma=0.01,
-    beta=0.5,
+    beta=0.2,
     use_second_order_info=False,
     sigma=0.2,
     alpha=0.1,
@@ -72,7 +75,7 @@ algorithm = TOAlgorithm(
     targetalpha=1e-6,
     targetsigma=1e-6,
     mcsamples=50,
-    max_iters=20,
+    max_iters=50,
     max_fi_iters=5
 )
 
@@ -199,6 +202,10 @@ def animate_box_push(xbar, ubar, x0, xg, block_size=1.0, finger_radius=0.1, robo
         translated = rotated + jnp.array([x, y])
         return translated
 
+    goal_corners = get_block_corners(xg[0], xg[1], xg[2], block_size)
+    faint_goal_patch, = ax.plot(goal_corners[:, 0], goal_corners[:, 1], color='gray', lw=2, alpha=0.25, label='Goal Box', zorder=2)
+    ax.legend()
+    
     def init():
         block_patch.set_data([], [])
         finger_patch.center = (0, 0)

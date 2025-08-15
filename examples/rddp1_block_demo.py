@@ -24,6 +24,8 @@ modelparams = ModelParams(
 # Define initial and goal states
 x0 = jnp.array([0.0, 0.0])
 xg = jnp.array([3.0, 0.0])
+# Define initial input (control)
+u0 = jnp.array([0.0])
 
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
@@ -35,7 +37,7 @@ params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
 # Define cost functions using partial
-dynamics = partial(block_on_ground, params=params_dynamics)
+dynamics = partial(block_on_ground_with_friction, params=params_dynamics)
 terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
 runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
 
@@ -44,6 +46,7 @@ toprob = TOProblemDefinition(
     terminalcost=terminalcost,
     dynamics=dynamics,
     starting_state=x0,
+    starting_input=u0,
     goal_state=xg,
     modelparams=modelparams
 )
@@ -61,7 +64,7 @@ algorithm = TOAlgorithm(
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=200,
+    mcsamples=2000,
     max_iters=200,
     max_fi_iters=50
 )

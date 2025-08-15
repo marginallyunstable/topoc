@@ -232,14 +232,14 @@ def backward_pass(
             Qx, Qu, Qxx, Qux, Quu = qinfo.Qx, qinfo.Qu, qinfo.Qxx, qinfo.Qux, qinfo.Quu
             n = Qxx.shape[0]
             m = Quu.shape[0]
-            Quu = Quu + reg * jnp.eye(m)
-            Qxx = Qxx + reg * jnp.eye(n)
+            Quu_reg = Quu + reg * jnp.eye(m)
+            # Qxx_reg = Qxx + reg * jnp.eye(n)
 
             def on_pd(L):
                 k = -jax.scipy.linalg.cho_solve((L, True), Qu)
                 K = -jax.scipy.linalg.cho_solve((L, True), Qux)
-                V_x_new = Qx + Qux.T @ k
-                V_xx_new = Qxx + Qux.T @ K
+                V_x_new = Qx + K.T @ Quu @ k + K.T @ Qu + Qux.T @ k
+                V_xx_new = Qxx + K.T @ Quu @ K + K.T @ Qux + Qux.T @ K
                 dV_new = dV + Qu.T @ k
                 # # Print shapes for debugging
                 # print("compute_step shapes: K", K.shape, "k", k.shape, "V_x_new", V_x_new.shape, "V_xx_new", V_xx_new.shape)
@@ -260,7 +260,7 @@ def backward_pass(
                 L = jax.scipy.linalg.cholesky(Q_uu + 1e-9 * jnp.eye(m), lower=True)
                 return is_pd, L
 
-            is_pd, L = try_chol_safe(Quu)
+            is_pd, L = try_chol_safe(Quu_reg)
             return lax.cond(
                 is_pd,
                 lambda _: on_pd(L),
@@ -403,7 +403,6 @@ def input_smoothed_traj_batch_derivatives(
         lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
         lfx=lfx, lfxx=lfxx
     )
-# endregion: Smoothed Trajectory Derivatives
 
 @partial(jax.jit, static_argnums=(2, 4))
 def input_smoothed_traj_batch_derivatives_qsim(
@@ -461,6 +460,8 @@ def input_smoothed_traj_batch_derivatives_qsim(
         lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
         lfx=lfx, lfxx=lfxx
     )
+
+# endregion: Smoothed Trajectory Derivatives
 
 def input_smoothed_dynamics_derivatives(
     x,

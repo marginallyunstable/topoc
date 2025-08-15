@@ -30,6 +30,7 @@ class RDDP1():
     def solve(self):
 
         xini = self.toproblem.starting_state
+        uini = self.toproblem.starting_input
         Nx = self.toproblem.modelparams.state_dim
         Nu = self.toproblem.modelparams.input_dim
         H = self.toproblem.modelparams.horizon_len
@@ -41,7 +42,7 @@ class RDDP1():
     
         xbar = jnp.zeros((H, Nx))
         xbar = xbar.at[0].set(xini) # set first element to initial state
-        ubar = jnp.zeros((H-1, Nu))
+        ubar = jnp.tile(uini, (H-1, 1))
         k = jnp.zeros((H-1, Nu))
         K = jnp.zeros((H-1, Nu, Nx))
 

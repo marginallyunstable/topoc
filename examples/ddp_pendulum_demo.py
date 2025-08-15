@@ -22,6 +22,8 @@ modelparams = ModelParams(
 # Define initial and goal states
 x0 = jnp.array([jnp.pi, 0.0])
 xg = jnp.array([0.0, 0.0])
+# Define initial input (control)
+u0 = jnp.array([0.0])
 
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
@@ -43,12 +45,13 @@ toprob = TOProblemDefinition(
     terminalcost=terminalcost,
     dynamics=dynamics,
     starting_state=x0,
+    starting_input=u0,
     goal_state=xg,
     modelparams=modelparams
 )
 
 # Define algorithm (example: DDP)
-algorithm = TOAlgorithm(AlgorithmName.DDP, gamma=0.01, beta=0.5, use_second_order_info=False)
+algorithm = TOAlgorithm(AlgorithmName.DDP, gamma=0.01, beta=0.5, use_second_order_info=True)
 
 print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)
