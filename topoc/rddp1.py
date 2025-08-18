@@ -26,7 +26,6 @@ class RDDP1():
         self.toproblem = toproblem
         self.toalgorithm = toalgorithm
 
-    from collections import namedtuple
     def solve(self):
 
         xini = self.toproblem.starting_state

@@ -32,6 +32,46 @@ def cartpole(x: Array, u: Array, params: Optional[Any] = None) -> Array:
     xnext = x + f_continuous * dt
     return xnext
 
+def cartpole_f(x, u, params):
+
+    mp = params['mp'] if params and "mp" in params else 1.0
+    mc = params['mc'] if params and "mc" in params else 10.0
+    pl = params['pl'] if params and "l" in params else 0.5
+    g  = params['g'] if params and "g" in params else 9.81
+
+    # x1, theta, dx, dtheta = x
+    x1, dx, theta, dtheta = x
+    s = jnp.sin(theta)
+    c = jnp.cos(theta)
+
+    C = jnp.array([[0, -mp * pl * dtheta * s],
+                   [0, 0]])
+    G = jnp.array([0, mp * g * pl * s])
+    B = jnp.array([1, 0])
+    H = jnp.array([[mc + mp, mp * pl * c],
+                   [mp * pl * c, mp * pl ** 2]])
+
+
+    Hinv = jnp.array([
+        [1 / (-mp * c**2 + mc + mp),
+         -c / (-mp * pl * c**2 + mc * pl + mp * pl)],
+        [-c / (-mp * pl * c**2 + mc * pl + mp * pl),
+         (mc + mp) / (-c**2 * mp**2 * pl**2 + mp**2 * pl**2 + mc * mp * pl**2)]
+    ])
+
+    qdd = Hinv @ (B * u - C @ jnp.array([dx, dtheta]) - G)
+    y = jnp.array([dx, qdd[0], dtheta, qdd[1]])
+
+    return y
+
+def rk_f(x, u, dt, f):
+
+    dx1 = f(x, u) * dt
+    dx2 = f(x + 0.5 * dx1, u) * dt
+    dx3 = f(x + 0.5 * dx2, u) * dt
+    dx4 = f(x + dx3, u) * dt
+    return x + (1.0 / 6.0) * (dx1 + 2 * dx2 + 2 * dx3 + dx4)
+
 def cartpole_with_friction(x: Array, u: Array, params: Optional[Any] = None) -> Array:
     """
     Block on ground model with friction (JAX-friendly).

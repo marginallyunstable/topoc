@@ -13,6 +13,7 @@ from topoc.types import *
 from topoc.ddp import DDP
 from topoc.rddp2 import RDDP2
 from topoc.rddp1 import RDDP1
+from topoc.sppdp import SPPDP
 
 class TOSolve:
     """
@@ -36,6 +37,9 @@ class TOSolve:
         elif self.algorithm.algo_type == AlgorithmName.RDDP2:
             rddp2 = RDDP2(self.problem, self.algorithm)
             return rddp2.solve()
+        elif self.algorithm.algo_type == AlgorithmName.SPPDP:
+            sppdp = SPPDP(self.problem, self.algorithm)
+            return sppdp.solve()
         else:
             raise ValueError(f"Unknown algorithm: {self.algorithm.algo_type}")
 
@@ -83,6 +87,7 @@ class TOProblemDefinition():
         hessianrunningcost: Optional[HessianRunningCostFn] = None,
         gradterminalcost: Optional[GradTerminalCostFn] = None,
         hessiantterminalcost: Optional[HessianTerminalCostFn] = None,
+        starting_state_cov: Optional[ArrayLike] = None,
     ):
         """
         Trajectory Optimization Problem initialization.
@@ -111,6 +116,7 @@ class TOProblemDefinition():
         self.hessianrunningcost = hessianrunningcost if hessianrunningcost is not None else quadratize(runningcost)
         self.gradterminalcost = gradterminalcost if gradterminalcost is not None else linearize(terminalcost)
         self.hessiantterminalcost = hessiantterminalcost if hessiantterminalcost is not None else quadratize(terminalcost)
+        self.starting_state_cov = jnp.array(starting_state_cov) if starting_state_cov is not None else jnp.zeros((self.starting_state.shape[0], self.starting_state.shape[0]))
 
 
 class TOAlgorithm:

@@ -65,6 +65,8 @@ class DDP():
                                                     regularization,
                                                     use_second_order_info=self.toalgorithm.params.use_second_order_info)
 
+                print(f"dV: {dV}")
+                
                 if not success:
                     regularization = max(regularization * 4, 1e-3)
 

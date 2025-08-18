@@ -38,14 +38,14 @@ class AlgorithmName(Enum):
     DDP = "DDP: Vanilla DDP"
     RDDP1 = "RDDP1: Randomized DDP with Smoothing in state and control space"
     RDDP2 = "RDDP2: Randomized DDP with Smoothing only in control space"
-    SPDDP = "SPDDP: Sigma Point Differential Dynamic Programming"
+    SPDP = "SPDDP: Sigma Point Dynamic Programming"
     SPPDP = "SPPDP: Sigma Point Probabilistic Dynamic Programming"
 
 class AlgorithmParams:
     """
     Namespace for all algorithm parameter classes.
         Common parameters for all algorithms:
-            beta: regularization reduction parameter
+            beta: line search reduction parameter
             gamma: scaling(reduction) factor for dV 
             use_second_order_info: whether to use second order information in the algorithm
             max_iters: maximum number of iterations for the algorithm
@@ -152,11 +152,46 @@ class AlgorithmParams:
             self.targetsigma = targetsigma
             self.mcsamples = mcsamples
 
-    class SPDDPParams:
-        def __init__(self, delta: float):
-            self.delta = delta
-
     class SPPDPParams:
+        """
+        SPPDP Parameters
+            spg_method: method for sigma point generation
+            sigma_x: initial noise for state space
+            sigma_u: initial noise for control space
+            sigma_red: reduction factor for sigma_x for next iteration
+            targetalpha: target value for alpha to stop the algorithm
+            targetsigma: target value for sigma to stop the algorithm
+        """
+        def __init__(self,
+                     beta: float = 0.5,
+                     gamma: float = 0.01,
+                     use_second_order_info: bool = False,
+                     max_iters: int = 200,
+                     max_fi_iters: int = 50,
+                     stopping_criteria: float = 1e-6,
+                     # SPPDP specific parameters
+                     spg_method: str = 'ut5_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
+                     eta: float = 1,  # forget factor for control policy
+                     lam: float = 100.0,  # temperature parameter
+                     zeta: float = 1.0,  # temperature change parameter
+                     zeta_factor: float = 2.0,  # temperature change factor
+                     zeta_min: float = 1e-2,  # minimum temperature parameter
+                     sigma_u: float = 2.0,):
+            self.beta = beta
+            self.gamma = gamma
+            self.use_second_order_info = use_second_order_info
+            self.max_iters = max_iters
+            self.max_fi_iters = max_fi_iters
+            self.stopping_criteria = stopping_criteria
+            self.spg_method = spg_method
+            self.eta = eta
+            self.lam = lam
+            self.zeta = zeta
+            self.zeta_factor = zeta_factor
+            self.zeta_min = zeta_min
+            self.sigma_u = sigma_u
+
+    class SPDPParams:
         def __init__(self, epsilon: float):
             self.epsilon = epsilon
 
@@ -165,9 +200,11 @@ algorithm_param_classes = {
     AlgorithmName.DDP: AlgorithmParams.DDPParams,
     AlgorithmName.RDDP1: AlgorithmParams.RDDP1Params,
     AlgorithmName.RDDP2: AlgorithmParams.RDDP2Params,
-    AlgorithmName.SPDDP: AlgorithmParams.SPDDPParams,
+    AlgorithmName.SPDP: AlgorithmParams.SPDPParams,
     AlgorithmName.SPPDP: AlgorithmParams.SPPDPParams,
 }
+
+SPG_METHOD_NAMES = ('gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws')
 
 # endregion: TOAlgorithm Parameters
 

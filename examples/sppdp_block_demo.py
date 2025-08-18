@@ -3,10 +3,12 @@ from jax import config
 config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from functools import partial
-from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_pendulum_results
+from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_block_results
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
-from models.pendulum import pendulum  # Assumes this exists
+from models.block import block_on_ground, block_on_ground_with_friction
 from topoc.types import ModelParams, AlgorithmName
+
+
 
 # Define model parameters (example values)
 state_dim = 2
@@ -22,23 +24,23 @@ modelparams = ModelParams(
 )
 
 # Define initial and goal states
-x0 = jnp.array([jnp.pi, 0.0])
-xg = jnp.array([0.0, 0.0])
+x0 = jnp.array([0.0, 0.0])
+covx0 = 1e-6 * jnp.eye(state_dim)
+xg = jnp.array([4.0, 0.0])
 # Define initial input (control)
 u0 = jnp.array([0.0])
 
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 1*jnp.eye(input_dim)
+R = 5*jnp.eye(input_dim)
 
-params_dynamics = {"m": 1.0, "g": 9.81, "l": 1.0, "dt": dt}
+params_dynamics = {"m": 1.0, "dt": dt}
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
 # Define cost functions using partial
-
-dynamics = partial(pendulum, params=params_dynamics)
+dynamics = partial(block_on_ground, params=params_dynamics)
 terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
 runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
 
@@ -47,23 +49,48 @@ toprob = TOProblemDefinition(
     terminalcost=terminalcost,
     dynamics=dynamics,
     starting_state=x0,
+    starting_state_cov=covx0,
     starting_input=u0,
     goal_state=xg,
     modelparams=modelparams
 )
 
-# Define algorithm (example: DDP)
-algorithm = TOAlgorithm(AlgorithmName.DDP, gamma=0.01, beta=0.5, use_second_order_info=True)
+# Define SPPDP algorithm parameters (example values)
+algorithm = TOAlgorithm(
+    AlgorithmName.SPPDP,
+    gamma=0.01,
+    beta=0.5,
+    spg_method='ut5_ws',
+    eta=0.01,
+    lam=100,
+    zeta=1,
+    zeta_factor=2,
+    zeta_min=1e-2,
+    sigma_u=1e-2,
+    max_iters=200,
+    max_fi_iters=50
+)
 
 print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)
 print("Gamma:", algorithm.params.gamma)
 print("Beta:", algorithm.params.beta)
-print("Use second order info:", algorithm.params.use_second_order_info)
+print("SPG Method:", algorithm.params.spg_method)
+print("Eta:", algorithm.params.eta)
+print("Lam:", algorithm.params.lam)
+print("Zeta:", algorithm.params.zeta)
+print("Lam Factor:", algorithm.params.zeta_factor)
+print("Lam Min:", algorithm.params.zeta_min)
+print("Sigma_u:", algorithm.params.sigma_u)
+print("Max iters:", algorithm.params.max_iters)
+print("Max fi iters:", algorithm.params.max_fi_iters)
 
+# Example usage: create and solve the problem with SPPDP
 tosolve = TOSolve(toprob, algorithm)
 xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
 
+print(Vstore[-1])  # Print the last value of the cost function
+
 # ---- Call plotting function ----
-plot_pendulum_results(tosolve.result, x0, xg, modelparams)
+plot_block_results(tosolve.result, x0, xg, modelparams)
 

@@ -1,4 +1,6 @@
 import jax
+from jax import config
+config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from functools import partial
 from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_cartpole_results
@@ -36,7 +38,7 @@ params_running = {"Q": Q, "R": R}
 
 # Define cost functions using partial
 
-dynamics = partial(cartpole_with_friction, params=params_dynamics)
+dynamics = partial(cartpole, params=params_dynamics)
 terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
 runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
 

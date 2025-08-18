@@ -26,7 +26,6 @@ class RDDP2():
         self.toproblem = toproblem
         self.toalgorithm = toalgorithm
 
-    from collections import namedtuple
     def solve(self):
 
         xini = self.toproblem.starting_state
@@ -69,18 +68,18 @@ class RDDP2():
 
                 while not success:
 
-                    # trajderivatives = input_smoothed_traj_batch_derivatives(
-                    #     xbar, ubar, self.toproblem,
-                    #     sigma=sigma,
-                    #     N_samples=self.toalgorithm.params.mcsamples,
-                    #     key=jax.random.PRNGKey(42)
-                    # )
-                    trajderivatives = input_smoothed_traj_batch_derivatives_qsim(
+                    trajderivatives = input_smoothed_traj_batch_derivatives(
                         xbar, ubar, self.toproblem,
                         sigma=sigma,
                         N_samples=self.toalgorithm.params.mcsamples,
                         key=jax.random.PRNGKey(42)
                     )
+                    # trajderivatives = input_smoothed_traj_batch_derivatives_qsim(
+                    #     xbar, ubar, self.toproblem,
+                    #     sigma=sigma,
+                    #     N_samples=self.toalgorithm.params.mcsamples,
+                    #     key=jax.random.PRNGKey(42)
+                    # )
                     # trajderivatives = input_smoothed_traj_chunked_batch_derivatives_qsim(
                     #     xbar, ubar, self.toproblem, chunk_size=5,
                     #     sigma=sigma,
@@ -91,6 +90,8 @@ class RDDP2():
                                                         regularization,
                                                         use_second_order_info=self.toalgorithm.params.use_second_order_info)
 
+                    print(f"dV: {dV}")
+                    
                     if not success:
                         regularization = max(regularization * 4, 1e-3)
 
