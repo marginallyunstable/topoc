@@ -108,7 +108,7 @@ class RDDP2():
 
                 if not done:
                     Vstore.append(Vprev)
-                    print(f"Line Search exhausted. Try playing with gamma/beta/max_iters. dV value being used: {dV}")
+                    print(f"Line Search exhausted. dV value expected was: {dV}")
                     break
 
                 Vstore.append(Vbar)

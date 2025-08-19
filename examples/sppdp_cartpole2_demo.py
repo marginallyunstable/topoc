@@ -69,7 +69,7 @@ algorithm = TOAlgorithm(
     zeta_factor=2,
     zeta_min=1e-2,
     sigma_u=1e-2,
-    max_iters=200,
+    max_iters=30,
     max_fi_iters=50
 )
 
@@ -90,6 +90,7 @@ print("Max fi iters:", algorithm.params.max_fi_iters)
 tosolve = TOSolve(toprob, algorithm)
 xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
 
+print(Vstore[0])  # Print the first value of the cost function
 print(Vstore[-1])  # Print the last value of the cost function
 
 # ---- Call plotting function ----

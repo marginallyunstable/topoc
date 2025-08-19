@@ -108,9 +108,13 @@ class SPPDP():
                     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
                 )
 
-                xbar, ubar, Vbar, eps, done, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs = forward_iteration_spm(
-                    xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs, eps,
-                    self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters,
+                # xbar, ubar, Vbar, eps, done, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs = forward_iteration_spm(
+                #     xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs, eps,
+                #     self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters,
+                # )
+                xbar, ubar, Vbar, eps, done, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs = forward_iteration_list_spm(
+                    xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs,
+                    self.toproblem, self.toalgorithm
                 )
 
                 
@@ -118,7 +122,7 @@ class SPPDP():
                 if not done:
                     Vstore.append(Vprev)
                     zeta = max(zeta / zeta_factor, zeta_min)
-                    print(f"Line Search exhausted. Zeta value is set to: {zeta}")
+                    print(f"Line Search exhausted. dV value expected was: {dV}. Zeta value is set to: {zeta}")
                     break
 
                 Vstore.append(Vbar)

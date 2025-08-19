@@ -77,14 +77,17 @@ class DDP():
 
             Vprev = Vbar # Store previous value to check post forward iteration
 
-            xbar, ubar, Vbar, eps, done = forward_iteration(
-                xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
+            # xbar, ubar, Vbar, eps, done = forward_iteration(
+            #     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
+            # )
+            xbar, ubar, Vbar, eps, done = forward_iteration_list(
+                xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm
             )
 
             if not done:
-                    Vstore.append(Vprev)
-                    print(f"Line Search exhausted. Try playing with gamma/beta/max_iters. dV value being used: {dV}")
-                    break
+                Vstore.append(Vprev)
+                print(f"Line Search exhausted. dV value expected was: {dV}")
+                break
 
             Vstore.append(Vbar)
             Change = Vprev - Vbar

@@ -1,3 +1,4 @@
+import jax
 from typing import NamedTuple, Callable, Tuple
 from jax import Array
 from enum import Enum
@@ -62,12 +63,14 @@ class AlgorithmParams:
                      use_second_order_info: bool = False,
                      max_iters: int = 200,
                      max_fi_iters: int = 50,
+                     eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-6):
             self.beta = beta
             self.gamma = gamma
             self.use_second_order_info = use_second_order_info
             self.max_iters = max_iters
             self.max_fi_iters = max_fi_iters
+            self.eps_list = eps_list
             self.stopping_criteria = stopping_criteria
 
     class RDDP1Params:
@@ -88,6 +91,7 @@ class AlgorithmParams:
                      use_second_order_info: bool = False,
                      max_iters: int = 200,
                      max_fi_iters: int = 50,
+                     eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-6,
                      # RDDP2 specific parameters
                      alpha: float = 10, # change in value function
@@ -103,6 +107,7 @@ class AlgorithmParams:
             self.use_second_order_info = use_second_order_info
             self.max_iters = max_iters
             self.max_fi_iters = max_fi_iters
+            self.eps_list = eps_list
             self.stopping_criteria = stopping_criteria
             self.alpha = alpha
             self.alpha_red = alpha_red
@@ -129,6 +134,7 @@ class AlgorithmParams:
                      use_second_order_info: bool = False,
                      max_iters: int = 200,
                      max_fi_iters: int = 50,
+                     eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-6,
                      # RDDP2 specific parameters
                      alpha: float = 10, # change in value function
@@ -143,6 +149,7 @@ class AlgorithmParams:
             self.use_second_order_info = use_second_order_info
             self.max_iters = max_iters
             self.max_fi_iters = max_fi_iters
+            self.eps_list = eps_list
             self.stopping_criteria = stopping_criteria
             self.alpha = alpha
             self.alpha_red = alpha_red
@@ -168,6 +175,7 @@ class AlgorithmParams:
                      use_second_order_info: bool = False,
                      max_iters: int = 200,
                      max_fi_iters: int = 50,
+                     eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-6,
                      # SPPDP specific parameters
                      spg_method: str = 'ut5_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
@@ -182,6 +190,7 @@ class AlgorithmParams:
             self.use_second_order_info = use_second_order_info
             self.max_iters = max_iters
             self.max_fi_iters = max_fi_iters
+            self.eps_list = eps_list
             self.stopping_criteria = stopping_criteria
             self.spg_method = spg_method
             self.eta = eta

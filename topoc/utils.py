@@ -1159,7 +1159,7 @@ def forward_iteration(
     return Xs_new, Us_new, V_new, eps, done
 
 @partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
-def forward_iteration_alpha(
+def forward_iteration_list(
     Xs,
     Us,
     Ks,
@@ -1168,13 +1168,13 @@ def forward_iteration_alpha(
     dV,
     toproblem: "TOProblemDefinition",
     toalgorithm: "TOAlgorithm",
-    eps_list,  # 1D array of candidate eps values (try in order)
 ):
     """
     Try each eps in eps_list in order. Accept the first eps that makes forward_pass
     produce a lower cost than Vprev. Returns (Xs_new, Us_new, V_new, eps_used, done).
     """
     # ensure array
+    eps_list = toalgorithm.params.eps_list
     eps_list = jnp.asarray(eps_list)
     # initial carry: use a sentinel eps (first element) as current held eps
     eps0 = eps_list[0]
@@ -1290,7 +1290,7 @@ def forward_iteration_spm(
     return Xs_new, Us_new, V_new, eps, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new
 
 @partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
-def forward_iteration_alpha_spm(
+def forward_iteration_list_spm(
     Xs, Us,
     Ks, ks,
     Vprev, dV,
@@ -1298,12 +1298,12 @@ def forward_iteration_alpha_spm(
     SPs, nX_SPs, Covs_Zs, chol_Covs_Zs,
     toproblem: "TOProblemDefinition",
     toalgorithm: "TOAlgorithm",
-    eps_list,
 ):
     """
-    Like forward_iteration_alpha but for the sigma-point forward_pass_spm.
+    Like forward_iteration_list but for the sigma-point forward_pass_spm.
     Returns (Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new)
     """
+    eps_list = toalgorithm.params.eps_list
     eps_list = jnp.asarray(eps_list)
     eps0 = eps_list[0]
     carry0 = (eps0, Vprev, Xs, Us, False, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs)
