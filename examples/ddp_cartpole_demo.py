@@ -64,5 +64,8 @@ print("Use second order info:", algorithm.params.use_second_order_info)
 tosolve = TOSolve(toprob, algorithm)
 xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
 
+print("Starting cost:", Vstore[0])  # Print the starting value of the cost function
+print("Final cost:", Vstore[-1])    # Print the final value of the cost function
+
 # ---- Call plotting function ----
 plot_cartpole_results(tosolve.result, x0, xg, modelparams)

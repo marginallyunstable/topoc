@@ -80,7 +80,7 @@ class DDP():
             # xbar, ubar, Vbar, eps, done = forward_iteration(
             #     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
             # )
-            xbar, ubar, Vbar, eps, done = forward_iteration_list(
+            xbar, ubar, Vbar, eps, done = forward_iteration(
                 xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm
             )
 

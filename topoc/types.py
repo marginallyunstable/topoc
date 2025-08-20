@@ -178,13 +178,15 @@ class AlgorithmParams:
                      eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-6,
                      # SPPDP specific parameters
-                     spg_method: str = 'ut5_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
+                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
+                     spg_params: dict = None,  # Parameters for the SPG method
                      eta: float = 1,  # forget factor for control policy
                      lam: float = 100.0,  # temperature parameter
                      zeta: float = 1.0,  # temperature change parameter
                      zeta_factor: float = 2.0,  # temperature change factor
                      zeta_min: float = 1e-2,  # minimum temperature parameter
-                     sigma_u: float = 2.0,):
+                     sigma_u: float = 2.0,
+                     mcsamples: int = 50):
             self.beta = beta
             self.gamma = gamma
             self.use_second_order_info = use_second_order_info
@@ -193,12 +195,14 @@ class AlgorithmParams:
             self.eps_list = eps_list
             self.stopping_criteria = stopping_criteria
             self.spg_method = spg_method
+            self.spg_params = {"order": 10, **(spg_params or {})}
             self.eta = eta
             self.lam = lam
             self.zeta = zeta
             self.zeta_factor = zeta_factor
             self.zeta_min = zeta_min
             self.sigma_u = sigma_u
+            self.mcsamples = mcsamples
 
     class SPDPParams:
         def __init__(self, epsilon: float):

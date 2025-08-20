@@ -11,7 +11,7 @@ from topoc.types import ModelParams, AlgorithmName
 # Define model parameters (example values)
 state_dim = 4
 input_dim = 1
-horizon_len = 500
+horizon_len = 200
 dt = 0.01
 
 modelparams = ModelParams(
@@ -58,14 +58,14 @@ algorithm = TOAlgorithm(
     gamma=0.01,
     beta=0.5,
     use_second_order_info=False,
-    sigma=2.0,
+    sigma=1e-2,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=2000,
-    max_iters=200,
+    mcsamples=25,
+    max_iters=35,
     max_fi_iters=50
 )
 

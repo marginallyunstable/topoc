@@ -53,7 +53,10 @@ class SPPDP():
         cov_policy = sigma_u * jnp.broadcast_to(jnp.eye(Nu), (H-1, Nu, Nu))
         cov_policy_inv = (1/sigma_u) * jnp.broadcast_to(jnp.eye(Nu), (H-1, Nu, Nu))
 
-        (xbar, ubar, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs), Vbar = forward_pass_spm(xbar, ubar, K, k, cov_policy, self.toproblem, self.toalgorithm)
+        (xbar, ubar, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs), Vbar = forward_pass_wup(xbar, ubar, K, k, cov_policy, self.toproblem, self.toalgorithm)
+        jax.debug.print("SPs: {sp}\nnX_SPs: {nxsp}", sp=SPs, nxsp=nX_SPs)
+        jax.debug.print("Covs_Zs: {covs}\nchol_Covs_Zs: {chol_covs}", covs=Covs_Zs, chol_covs=chol_Covs_Zs)
+        
         # endregion: Initialize Simulation
 
         # region: Algorithm Iterations
@@ -77,7 +80,7 @@ class SPPDP():
                 while not success:
 
                     dV, success, K_new, k_new, V_new, Vx_new, Vxx_new, \
-                    cov_policy_new, cov_policy_inv_new = backward_pass_spm( xbar,ubar,
+                    cov_policy_new, cov_policy_inv_new = backward_pass_wup( xbar,ubar,
                                                                             k, K, SPs, nX_SPs,
                                                                             Covs_Zs, chol_Covs_Zs, zeta,
                                                                             cov_policy, cov_policy_inv,
@@ -104,15 +107,19 @@ class SPPDP():
                 # TODO: change the criterion for forward iteration V < Vprev
 
                 # To warm start forward_iteration_spm
+                # xbar_, ubar_, Vbar, eps, done = forward_iteration(
+                #     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
+                # )
                 xbar_, ubar_, Vbar, eps, done = forward_iteration(
-                    xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
+                    xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm,
                 )
+                
 
                 # xbar, ubar, Vbar, eps, done, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs = forward_iteration_spm(
                 #     xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs, eps,
                 #     self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters,
                 # )
-                xbar, ubar, Vbar, eps, done, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs = forward_iteration_list_spm(
+                xbar, ubar, Vbar, eps, done, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs = forward_iteration_wup(
                     xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs,
                     self.toproblem, self.toalgorithm
                 )

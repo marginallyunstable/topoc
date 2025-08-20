@@ -91,7 +91,7 @@ class RDDP1():
                 Vprev = Vbar # Store previous value to check post forward iteration
 
                 xbar, ubar, Vbar, eps, done = forward_iteration(
-                    xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
+                    xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm
                 )
 
                 if not done:

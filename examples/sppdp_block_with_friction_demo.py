@@ -25,6 +25,7 @@ modelparams = ModelParams(
 
 # Define initial and goal states
 x0 = jnp.array([0.0, 0.0])
+covx0 = 1e-6 * jnp.eye(state_dim)
 xg = jnp.array([4.0, 0.0])
 # Define initial input (control)
 u0 = jnp.array([0.0])
@@ -48,24 +49,25 @@ toprob = TOProblemDefinition(
     terminalcost=terminalcost,
     dynamics=dynamics,
     starting_state=x0,
+    starting_state_cov=covx0,
     starting_input=u0,
     goal_state=xg,
     modelparams=modelparams
 )
 
-# Define RDDP2 algorithm parameters (example values)
+# Define SPPDP algorithm parameters (example values)
 algorithm = TOAlgorithm(
-    AlgorithmName.RDDP2,
+    AlgorithmName.SPPDP,
     gamma=0.01,
     beta=0.5,
-    use_second_order_info=True,
-    sigma=10,
-    alpha=0.1,
-    alpha_red=2.0,
-    sigma_red=2.0,
-    targetalpha=1e-6,
-    targetsigma=1e-6,
-    mcsamples=49,
+    spg_method='gh_ws',
+    spg_params={"order": 10},
+    eta=0.001,
+    lam=100,
+    zeta=1,
+    zeta_factor=2,
+    zeta_min=1e-2,
+    sigma_u=10,
     max_iters=50,
     max_fi_iters=50
 )
@@ -74,11 +76,17 @@ print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)
 print("Gamma:", algorithm.params.gamma)
 print("Beta:", algorithm.params.beta)
-print("Sigma:", algorithm.params.sigma)
-print("Alpha:", algorithm.params.alpha)
-print("Use second order info:", algorithm.params.use_second_order_info)
+print("SPG Method:", algorithm.params.spg_method)
+print("Eta:", algorithm.params.eta)
+print("Lam:", algorithm.params.lam)
+print("Zeta:", algorithm.params.zeta)
+print("Lam Factor:", algorithm.params.zeta_factor)
+print("Lam Min:", algorithm.params.zeta_min)
+print("Sigma_u:", algorithm.params.sigma_u)
+print("Max iters:", algorithm.params.max_iters)
+print("Max fi iters:", algorithm.params.max_fi_iters)
 
-# Example usage: create and solve the problem with RDDP2
+# Example usage: create and solve the problem with SPPDP
 tosolve = TOSolve(toprob, algorithm)
 xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
 

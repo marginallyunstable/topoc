@@ -11,7 +11,7 @@ from topoc.types import ModelParams, AlgorithmName
 # Define model parameters (example values)
 state_dim = 4
 input_dim = 1
-horizon_len = 500
+horizon_len = 200
 dt = 0.01
 
 modelparams = ModelParams(
@@ -60,14 +60,15 @@ algorithm = TOAlgorithm(
     AlgorithmName.SPPDP,
     gamma=0.01,
     beta=0.5,
-    spg_method='ut9_ws',
+    spg_method='gh_ws',
+    spg_params={"order": 5},
     eta=0.01,
     lam=100,
     zeta=1,
     zeta_factor=2,
     zeta_min=1e-2,
     sigma_u=1e-2,
-    max_iters=30,
+    max_iters=35,
     max_fi_iters=50
 )
 
@@ -88,7 +89,8 @@ print("Max fi iters:", algorithm.params.max_fi_iters)
 tosolve = TOSolve(toprob, algorithm)
 xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
 
-print(Vstore[-1])  # Print the last value of the cost function
+print("Starting cost:", Vstore[0])  # Print the starting value of the cost function
+print("Final cost:", Vstore[-1])    # Print the final value of the cost function
 
 # ---- Call plotting function ----
 plot_cartpole_results(tosolve.result, x0, xg, modelparams)
