@@ -58,8 +58,6 @@ toprob = TOProblemDefinition(
 # Define SPPDP algorithm parameters (example values)
 algorithm = TOAlgorithm(
     AlgorithmName.SPPDP,
-    gamma=0.01,
-    beta=0.5,
     spg_method='gh_ws',
     spg_params={"order": 5},
     eta=0.01,

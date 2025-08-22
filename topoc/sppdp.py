@@ -33,10 +33,6 @@ class SPPDP():
         Nx = self.toproblem.modelparams.state_dim
         Nu = self.toproblem.modelparams.input_dim
         H = self.toproblem.modelparams.horizon_len
-        # spg_func = getattr(utils, self.toalgorithm.params.spg_method)
-        # wsp_r, usp_r = spg_func(Nx+Nu) # sigma point weights (wsp_r) and unit sigma points (usp_r) for running part of trajectory
-        # wsp_f, usp_f = spg_func(Nx) # sigma point weights (wsp_f) and unit sigma points (usp_f) for final step of trajectory
-        # sp_dict = {'wsp_r': wsp_r, 'usp_r': usp_r, 'wsp_f': wsp_f, 'usp_f': usp_f}
         zeta = self.toalgorithm.params.zeta
         zeta_factor = self.toalgorithm.params.zeta_factor
         zeta_min = self.toalgorithm.params.zeta_min
@@ -54,8 +50,8 @@ class SPPDP():
         cov_policy_inv = (1/sigma_u) * jnp.broadcast_to(jnp.eye(Nu), (H-1, Nu, Nu))
 
         (xbar, ubar, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs), Vbar = forward_pass_wup(xbar, ubar, K, k, cov_policy, self.toproblem, self.toalgorithm)
-        jax.debug.print("SPs: {sp}\nnX_SPs: {nxsp}", sp=SPs, nxsp=nX_SPs)
-        jax.debug.print("Covs_Zs: {covs}\nchol_Covs_Zs: {chol_covs}", covs=Covs_Zs, chol_covs=chol_Covs_Zs)
+        # jax.debug.print("SPs: {sp}\nnX_SPs: {nxsp}", sp=SPs, nxsp=nX_SPs)
+        # jax.debug.print("Covs_Zs: {covs}\nchol_Covs_Zs: {chol_covs}", covs=Covs_Zs, chol_covs=chol_Covs_Zs)
         
         # endregion: Initialize Simulation
 
@@ -91,7 +87,7 @@ class SPPDP():
                         regularization = max(regularization * 4, 1e-3)
                         print(f"Backward Pass failed. Setting regularization to: {regularization}")
 
-                # Note: this doesn't need to be done for other algorithms, because others calculate k, K directly and not update it.
+                # Note: this doesn't need to be done for other algorithms, because others calculate k, K directly and not UPDATE it.
                 K = K_new
                 k = k_new
                 cov_policy = cov_policy_new
@@ -101,36 +97,44 @@ class SPPDP():
                 if regularization < 1e-6:
                     regularization = 0.0
 
-                dV = V_new[0] - Vbar
+                dV = V_new[0] - Vbar # Expected change in value function
                 Vprev = Vbar # Store previous value to check post forward iteration
 
-                # TODO: change the criterion for forward iteration V < Vprev
-
-                # To warm start forward_iteration_spm
-                # xbar_, ubar_, Vbar, eps, done = forward_iteration(
-                #     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
-                # )
-                xbar_, ubar_, Vbar, eps, done = forward_iteration(
+                # To warm start forward_iteration_wup (forward_iteration is cheaper than forward_iteration_wup)
+                _, _, _, eps_opt, done = forward_iteration(
                     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm,
                 )
-                
 
-                # xbar, ubar, Vbar, eps, done, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs = forward_iteration_spm(
-                #     xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs, eps,
-                #     self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters,
-                # )
-                xbar, ubar, Vbar, eps, done, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs = forward_iteration_wup(
+                xbar_new, ubar_new, Vbar_new, eps, done, \
+                      SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new = forward_iteration_wup(
                     xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs,
                     self.toproblem, self.toalgorithm
                 )
 
-                
+                print(f"eps_opt: {eps_opt}")
 
                 if not done:
                     Vstore.append(Vprev)
                     zeta = max(zeta / zeta_factor, zeta_min)
                     print(f"Line Search exhausted. dV value expected was: {dV}. Zeta value is set to: {zeta}")
                     break
+
+                
+                # xbar_new, ubar_new, Vbar_new, eps, _, \
+                #       SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new = forward_iteration_wup_once(
+                #     xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs, eps_opt,
+                #     self.toproblem, self.toalgorithm
+                # )
+
+                print(f"eps after forward_iteration_wup: {eps}")
+
+                xbar = xbar_new
+                ubar = ubar_new
+                Vbar = Vbar_new
+                SPs = SPs_new
+                nX_SPs = nX_SPs_new
+                Covs_Zs = Covs_Zs_new
+                chol_Covs_Zs = chol_Covs_Zs_new
 
                 Vstore.append(Vbar)
                 Change = Vprev - Vbar
@@ -140,17 +144,13 @@ class SPPDP():
 
                 zeta = zeta * zeta_factor
                 print(f"Line Search succeeded. Zeta value is set to: {zeta}")
-
-                # if Change < self.toalgorithm.params.alpha or iter > self.toalgorithm.params.max_iters:
-                #     print(f"Converged in {iter} iteration(s). [Inner Loop]")
-                #     break
                 
-                # Stupid, but keeping this structure in case complete EM-step is performed
+                # Stupid! but keeping this structure in case complete M-step of EM is performed
                 if True:
                     break
 
             if (iter == self.toalgorithm.params.max_iters
-                or Change <= self.toalgorithm.params.stopping_criteria
+                or abs(Change) <= self.toalgorithm.params.stopping_criteria
             ):
                 print(f"Maximum iterations reached/Converged in {iter} iteration(s).")
                 break

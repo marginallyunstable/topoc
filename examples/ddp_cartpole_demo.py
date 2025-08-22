@@ -11,7 +11,7 @@ from topoc.types import ModelParams, AlgorithmName
 # Define model parameters (example values)
 state_dim = 4
 input_dim = 1
-horizon_len = 500
+horizon_len = 200
 dt = 0.01
 
 modelparams = ModelParams(
@@ -53,7 +53,7 @@ toprob = TOProblemDefinition(
 )
 
 # Define algorithm (example: DDP)
-algorithm = TOAlgorithm(AlgorithmName.DDP, gamma=0.01, beta=0.5, use_second_order_info=False, max_iters=200, max_fi_iters=50, stopping_criteria=1e-6)
+algorithm = TOAlgorithm(AlgorithmName.DDP, use_second_order_info=True, max_iters=50)
 
 print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)

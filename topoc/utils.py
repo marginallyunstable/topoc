@@ -298,10 +298,15 @@ def forward_pass_wup(
             x_sigma_points = sigma_points[:, :xdim]  # shape (N_sigma, nx)
             u_sigma_points = sigma_points[:, xdim:]  # shape (N_sigma, nu)
 
+            # jax.debug.print("x_sigma_points: {}", x_sigma_points)
+            # jax.debug.print("u_sigma_points: {}", u_sigma_points)
+
             # transported sigma points to state space through dynamics
             nx_sigma_points = batched_dynamics(x_sigma_points, u_sigma_points) # shape (N_sigma, nx) 
 
             nx = wsp_r @ nx_sigma_points  # shape (nx,)
+
+            # jax.debug.print("nx: {}", nx)
 
             ncov_x = (nx_sigma_points - nx).T @ (wsp_r[:, None] * (nx_sigma_points - nx))  # shape (nx, nx)
 
@@ -915,6 +920,99 @@ def input_smoothed_dynamics_derivatives(
     return fx_s, fxx_s, fu_s, fux_s, fuu_s
 
 
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def input_smoothed_traj_batch_derivatives_spm(
+    Xs,  # (N, Nx)
+    Us,  # (N-1, Nu)
+    sigma,
+    toproblem: "TOProblemDefinition",
+    toalgorithm: "TOAlgorithm"
+):
+    """
+    Compute all derivatives for a trajectory using input_smoothed_dynamics_derivatives for dynamics part.
+    Returns:
+        TrajDerivatives object with attributes:
+            fx, fu: (N-1, Nx, Nx), (N-1, Nx, Nu)
+            fxx, fxu, fux, fuu: (N-1, Nx, Nx, Nx), (N-1, Nx, Nx, Nu), (N-1, Nx, Nu, Nx), (N-1, Nx, Nu, Nu)
+            lx, lu: (N-1, Nx), (N-1, Nu)
+            lxx, lxu, lux, luu: (N-1, Nx, Nx), (N-1, Nx, Nu), (N-1, Nu, Nx), (N-1, Nu, Nu)
+            lfx: (Nx,)
+            lfxx: (Nx, Nx)
+    """
+    spg_func = get_spg_func(toalgorithm.params.spg_method)
+    xdim = toproblem.modelparams.state_dim
+    udim = toproblem.modelparams.input_dim
+    wsp, usp = spg_func(udim, toalgorithm.params.spg_params)
+    cov_diag = jnp.concatenate([jnp.full((udim,), sigma)])
+    cov_matrix = jnp.diag(cov_diag)
+    _, chol_Cov_U = safe_cholesky_eig(cov_matrix)
+
+    Zs = jnp.concatenate([Xs[:-1], Us], axis=1)  # shape (N-1, Nx+Nu)
+
+    
+    # Get cost derivatives as usual
+    gradrunningcost = toproblem.gradrunningcost
+    hessianrunningcost = toproblem.hessianrunningcost
+    gradterminalcost = toproblem.gradterminalcost
+    hessiantterminalcost = toproblem.hessiantterminalcost
+
+    # Prepare dynamics functions
+    f = toproblem.dynamics
+    fx = jax.jacrev(f, argnums=0)
+    fxx = jax.hessian(f, argnums=0)
+
+    def calc_smoothed_dynamics_derivatives(Zs):
+        Us = Zs[xdim:]
+        SPs = Us[:, None] + chol_Cov_U @ usp  # shape (nu, N_sigma)
+        us = SPs.T  # shape (N_sigma, nu)
+        # xs = jnp.repeat(Zs[:xdim][None, :], us.shape[0], axis=0)  # shape (N_sigma, nx)
+        # N = SPs.shape[0]  # number of sigma points (length of first dimension of SPs)
+        f_plus = jax.vmap(lambda up: f(Zs[:xdim], up))(us)  # [N, Nx]
+        
+        fx_plus = jax.vmap(lambda up: fx(Zs[:xdim], up))(us)  # [N, Nx, Nx]
+        fx_s = jnp.einsum('n,nij->ij', wsp, fx_plus)
+        fxx_plus = jax.vmap(lambda up: fxx(Zs[:xdim], up))(us)  # [N, Nx, Nx, Nx]
+        fxx_s = jnp.einsum('n,nijk->ijk', wsp, fxx_plus)
+        
+        # f_plus_mean = wsp @ f_plus
+        # fx_s, fu_s = calc_AB_lstsq(xs, us, f_plus, f_plus_mean, Zs[:xdim], Zs[xdim:])
+
+        usp_ = usp.T
+        eps_outer = usp_[:, :, None] * usp_[:, None, :]  # [N, Nx+Nu, Nx+Nu
+        eps_outer = eps_outer - jnp.eye(udim)[None, :, :]  # [N, Nu, Nu]
+        L_inv = jax.scipy.linalg.solve_triangular(chol_Cov_U, jnp.eye(chol_Cov_U.shape[0]), lower=True)
+        # transform eps_outer into the unit/sigma basis: L^{-1} @ e @ L^{-T}
+        eps_outer_transformed = jax.vmap(lambda e: L_inv.T @ e @ L_inv)(eps_outer)
+        # fzz_s = jnp.einsum('nd,nij->dij', f_plus, eps_outer_transformed) / N  # [Nx, Nx+Nu, Nx+Nu]
+        fuu_s = jnp.einsum('n,nd,nij->dij', wsp, f_plus, eps_outer_transformed) # [Nx, Nx+Nu, Nx+Nu]
+        
+        eps = usp_
+        eps_transformed = jax.vmap(lambda e: L_inv @ e)(eps)
+        fu_s = jnp.einsum('n,ni,nj->ij', wsp, f_plus, eps_transformed)
+        fux_s = jnp.einsum('n,nij,nk->ikj', wsp, fx_plus, eps_transformed)
+
+
+        return fx_s, fu_s, fxx_s, fux_s, fuu_s
+
+    fx_s, fu_s, fxx_s, fux_s, fuu_s = jax.vmap(calc_smoothed_dynamics_derivatives)(Zs)
+
+    # Cost derivatives as usual
+    lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
+    (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+
+    # Terminal cost on last state (Xs[-1])
+    lfx = gradterminalcost(Xs[-1])
+    lfxx = hessiantterminalcost(Xs[-1])
+
+    return TrajDerivatives(
+        fxs=fx_s, fus=fu_s,
+        fxxs=fxx_s, fxus=None, fuxs=fux_s, fuus=fuu_s,
+        lxs=lxs, lus=lus,
+        lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
+        lfx=lfx, lfxx=lfxx
+    )
+
+
 # region: Smoothed Trajectory Derivatives
 @partial(jax.jit, static_argnums=(2, 5))
 def state_input_smoothed_traj_batch_derivatives(
@@ -1012,7 +1110,7 @@ def state_input_smoothed_dynamics_derivatives(
     # Vectorized evaluation of f, fx, fxx
     f_plus = jax.vmap(lambda xp, up: f(xp, up))(x_plus, u_plus)  # [N, Nx]
     f_minus = jax.vmap(lambda xm, um: f(xm, um))(x_minus, u_minus)  # [N, Nx]
-
+    f_plus_mean = jnp.mean(f_plus, axis=0)  # [Nx]
     # # fx, fu
     # f_diff = (f_plus - f_minus) / (2)  # [N, Nx]
     # # f_diff = f_plus  # [N, Nx]
@@ -1021,7 +1119,7 @@ def state_input_smoothed_dynamics_derivatives(
     # fx_s = fz_s[:, :Nx]  # [Nx, Nx]
     # fu_s = fz_s[:, Nx:]  # [Nx, Nu]
 
-    fx_s, fu_s = calc_AB_lstsq(x_plus, u_plus, f_plus, x, u)
+    fx_s, fu_s = calc_AB_lstsq(x_plus, u_plus, f_plus, f_plus_mean, x, u)
 
     # fu_s = (f_diff.T @ eps_u) / N / C_u  # [Nx, Nu]
     # fx_s = (f_diff.T @ eps_x) / N / C_x  # [Nx, Nx]
@@ -1038,6 +1136,90 @@ def state_input_smoothed_dynamics_derivatives(
     fuu_s = fzz_s[:, Nx:, Nx:]  # [Nu, Nu, Nu]
 
     return fx_s, fxx_s, fu_s, fux_s, fuu_s
+
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def state_input_smoothed_traj_batch_derivatives_spm(
+    Xs,  # (N, Nx)
+    Us,  # (N-1, Nu)
+    sigma_x,
+    sigma_u,
+    toproblem: "TOProblemDefinition",
+    toalgorithm: "TOAlgorithm",
+):
+    """
+    Compute all derivatives for a trajectory using state_input_smoothed_dynamics_derivatives for dynamics part.
+    Returns:
+        TrajDerivatives object with attributes:
+            fx, fu: (N-1, Nx, Nx), (N-1, Nx, Nu)
+            fxx, fxu, fux, fuu: (N-1, Nx, Nx, Nx), (N-1, Nx, Nx, Nu), (N-1, Nx, Nu, Nx), (N-1, Nx, Nu, Nu)
+            lx, lu: (N-1, Nx), (N-1, Nu)
+            lxx, lxu, lux, luu: (N-1, Nx, Nx), (N-1, Nx, Nu), (N-1, Nu, Nx), (N-1, Nu, Nu)
+            lfx: (Nx,)
+            lfxx: (Nx, Nx)
+    """
+    spg_func = get_spg_func(toalgorithm.params.spg_method)
+    xdim = toproblem.modelparams.state_dim
+    udim = toproblem.modelparams.input_dim
+    wsp, usp = spg_func(xdim + udim, toalgorithm.params.spg_params)
+    cov_diag = jnp.concatenate([jnp.full((xdim,), sigma_x), jnp.full((udim,), sigma_u)])
+    cov_matrix = jnp.diag(cov_diag)
+    _, chol_Cov_Z = safe_cholesky_eig(cov_matrix)
+
+    Zs = jnp.concatenate([Xs[:-1], Us], axis=1)  # shape (N-1, Nx+Nu)
+
+    # Get cost derivatives as usual
+    gradrunningcost = toproblem.gradrunningcost
+    hessianrunningcost = toproblem.hessianrunningcost
+    gradterminalcost = toproblem.gradterminalcost
+    hessiantterminalcost = toproblem.hessiantterminalcost
+
+    # Prepare dynamics functions
+    f = toproblem.dynamics
+
+    def calc_smoothed_dynamics_derivatives(Zs):
+
+        SPs = Zs[:, None] + chol_Cov_Z @ usp  # shape (nz, N_sigma)
+        SPs = SPs.T  # shape (N_sigma, nz)
+        # N = SPs.shape[0]  # number of sigma points (length of first dimension of SPs)
+        xs = SPs[:, :xdim]  # shape (N_sigma, Nx)
+        us = SPs[:, xdim:]  # shape (N_sigma, Nu)
+        f_plus = jax.vmap(lambda xp, up: f(xp, up))(xs, us)  # [N, Nx]
+        f_plus_mean = wsp @ f_plus  # weighted mean of f_plus over sigma points
+        fx_s, fu_s = calc_AB_lstsq(xs, us, f_plus, f_plus_mean, Zs[:xdim], Zs[xdim:])
+
+        usp_ = usp.T
+        eps_outer = usp_[:, :, None] * usp_[:, None, :]  # [N, Nx+Nu, Nx+Nu]
+        eps_outer = eps_outer - jnp.eye(xdim + udim)[None, :, :]  # [N, Nx+Nu, Nx+Nu]
+        L_inv = jax.scipy.linalg.solve_triangular(chol_Cov_Z, jnp.eye(chol_Cov_Z.shape[0]), lower=True)
+        # transform eps_outer into the unit/sigma basis: L^{-1} @ e @ L^{-T}
+        eps_outer_transformed = jax.vmap(lambda e: L_inv.T @ e @ L_inv)(eps_outer)
+        # fzz_s = jnp.einsum('nd,nij->dij', f_plus, eps_outer_transformed) / N  # [Nx, Nx+Nu, Nx+Nu]
+        fzz_s = jnp.einsum('n,nd,nij->dij', wsp, f_plus, eps_outer_transformed) # [Nx, Nx+Nu, Nx+Nu]
+        fxx_s = fzz_s[:, :xdim, :xdim]  # [Nx, Nx, Nx]
+        fux_s = fzz_s[:, xdim:, :xdim]  # [Nx, Nu, Nx]
+        fuu_s = fzz_s[:, xdim:, xdim:]  # [Nu, Nu, Nu]
+
+        return fx_s, fu_s, fxx_s, fux_s, fuu_s
+
+    fx_s, fu_s, fxx_s, fux_s, fuu_s = jax.vmap(calc_smoothed_dynamics_derivatives)(Zs)
+
+    # Cost derivatives as usual
+    lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
+    (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+
+    # Terminal cost on last state (Xs[-1])
+    lfx = gradterminalcost(Xs[-1])
+    lfxx = hessiantterminalcost(Xs[-1])
+
+    return TrajDerivatives(
+        fxs=fx_s, fus=fu_s,
+        fxxs=fxx_s, fxus=None, fuxs=fux_s, fuus=fuu_s,
+        lxs=lxs, lus=lus,
+        lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
+        lfx=lfx, lfxx=lfxx
+    )
+
 
 @partial(jax.jit, static_argnames=("terminalcost", "wsp_f", "usp_f"))
 def VTerminalInfo_wup(x_f, chol_cov, terminalcost, wsp_f, usp_f):
@@ -1304,7 +1486,10 @@ def forward_iteration(
         return carry_out, None
 
     final_carry, _ = lax.scan(body, carry0, eps_list)
+
     eps_used, V_new, Xs_new, Us_new, done = final_carry
+    # eps_index = jnp.where(eps_list == eps_used, size=1)[0][0]
+    # eps_list_new = eps_list[eps_index:]
     return Xs_new, Us_new, V_new, eps_used, done
 
 @partial(jax.jit, static_argnames=("toproblem", "toalgorithm", "max_fi_iters"))
@@ -1406,7 +1591,7 @@ def forward_iteration_wup(
     """
     Like forward_iteration_list but for the sigma-point forward_pass_wup.
     Returns (Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new)
-    """
+    # """
     eps_list = toalgorithm.params.eps_list
     eps_list = jnp.asarray(eps_list)
     eps0 = eps_list[0]
@@ -1443,8 +1628,29 @@ def forward_iteration_wup(
 
     return Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new
 
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def forward_iteration_wup_once(
+    Xs, Us,
+    Ks, ks,
+    Vprev, dV,
+    cov_policy,
+    SPs, nX_SPs, Covs_Zs, chol_Covs_Zs, eps_opt,
+    toproblem: "TOProblemDefinition",
+    toalgorithm: "TOAlgorithm",
+):
+    """
+    Like forward_iteration_list but for the sigma-point forward_pass_wup.
+    Returns (Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new)
+    # """
 
-def calc_AB_lstsq(x_batch, u_batch, x_next_batch, x_nominal, u_nominal):
+    (Xs_new, Us_new, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new), V_new = forward_pass_wup(
+        Xs, Us, Ks, ks, cov_policy, toproblem, toalgorithm, eps_opt
+    )
+
+    return Xs_new, Us_new, V_new, eps_opt, True, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new
+
+
+def calc_AB_lstsq(x_batch, u_batch, x_next_batch, x_next_batch_mean, x_nominal, u_nominal):
     """
     Estimate A, B from batch data.
 
@@ -1466,7 +1672,8 @@ def calc_AB_lstsq(x_batch, u_batch, x_next_batch, x_nominal, u_nominal):
     # Center data
     dx = x_batch - x_nominal  # (N, n_x)
     du = u_batch - u_nominal  # (N, n_u)
-    x_next_mean = jnp.mean(x_next_batch, axis=0)
+    # x_next_mean = jnp.mean(x_next_batch, axis=0)
+    x_next_mean = x_next_batch_mean
     dy = x_next_batch - x_next_mean  # (N, n_x)
 
     # Stack inputs horizontally: [du | dx]
@@ -2228,6 +2435,296 @@ def plot_cartpole_results(result, x0, xg, modelparams):
     ax22.set_ylim(vmin, vmax * 1.05)
     cbar3 = plt.colorbar(line_v, ax=ax22, pad=0.02)
     cbar3.set_label('Cost (Vstore)')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_compare_block_results(algorithms, x0, xg, modelparams):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import matplotlib as mpl
+    import seaborn as sns
+
+    # Use seaborn theme and palette
+    sns.set_theme(style="darkgrid")
+    sns.set_context('notebook', font_scale=1.1)
+
+    # modern seaborn color palette (deep) sized to number of algorithms
+    n_alg = max(1, len(algorithms))
+    # palette = sns.color_palette('magma', n_colors=n_alg)
+    palette = sns.color_palette("flare", n_colors=n_alg)
+    colors = [palette[i % len(palette)] for i in range(len(algorithms))]
+    # colors = [mpl.cm.magma(v) for v in np.linspace(0, 1, n_alg)]
+    linestyles = ['-', '--', '-.', ':']
+    # reverse linestyles so the last algorithm (SPPDP) gets solid '-' by default
+    linestyles = list(reversed(linestyles))
+
+    mpl.rcParams.update({
+        'figure.figsize': (14, 5),
+        'axes.titlesize': 14,
+        'axes.labelsize': 12,
+        'legend.fontsize': 10,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'lines.linewidth': 2.2,
+    })
+
+    dt = modelparams.dt
+
+    fig, axs = plt.subplots(1, 3, figsize=(14, 5))
+
+    # Phase plot (position vs velocity)
+    ax = axs[0]
+    for i, (name, xbar, _, _) in enumerate(algorithms):
+        xb = np.asarray(xbar)
+        if xb.ndim == 1 or xb.shape[0] < 2:
+            continue
+        ax.plot(xb[:, 0], xb[:, 1], color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+    x0_np = np.asarray(x0)
+    xg_np = np.asarray(xg)
+    ax.scatter(x0_np[0], x0_np[1], color='red', s=60, marker='o', label='Start')
+    ax.scatter(xg_np[0], xg_np[1], color='green', s=80, marker='*', label='Goal')
+    ax.set_xlabel('Position')
+    ax.set_ylabel('Velocity')
+    ax.set_title('Phase Plot')
+    ax.legend(frameon=True)
+    ax.grid(alpha=0.45)
+
+    # Input vs time
+    ax2 = axs[1]
+    for i, (name, _, ubar, _) in enumerate(algorithms):
+        ub = np.asarray(ubar)
+        uvals = ub if ub.ndim == 1 else ub[:, 0]
+        t = np.arange(uvals.shape[0]) * dt
+        ax2.plot(t, uvals, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Input')
+    ax2.set_title('Input vs Time')
+    ax2.legend(frameon=True)
+    ax2.grid(alpha=0.45)
+
+    # Vstore (log scale)
+    ax3 = axs[2]
+    V_list = [np.asarray(Vstore) for (_, _, _, Vstore) in algorithms]
+    if len(V_list) == 0:
+        return
+    global_min = min([V.min() for V in V_list])
+    offset = 0.0
+    if global_min <= 0:
+        offset = 1e-12 - global_min
+    for i, (name, _, _, Vstore) in enumerate(algorithms):
+        V = np.asarray(Vstore) + offset
+        it = np.arange(len(V))
+        ax3.plot(it, V, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+    ax3.set_yscale('log')
+    ax3.set_xlabel('Iteration')
+    ax3.set_ylabel('Vstore')
+    ax3.set_title('Cost vs Iteration (log)')
+    ax3.legend(frameon=True)
+    ax3.grid(which='both', alpha=0.35)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_compare_pendulum_results(algorithms, x0, xg, modelparams):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import matplotlib as mpl
+    import seaborn as sns
+
+    # Use seaborn theme and palette
+    sns.set_theme(style="darkgrid")
+    sns.set_context('notebook', font_scale=1.1)
+
+    # modern seaborn color palette (deep) sized to number of algorithms
+    n_alg = max(1, len(algorithms))
+    # palette = sns.color_palette('magma', n_colors=n_alg)
+    palette = sns.color_palette("flare", n_colors=n_alg)
+    colors = [palette[i % len(palette)] for i in range(len(algorithms))]
+    # colors = [mpl.cm.magma(v) for v in np.linspace(0, 1, n_alg)]
+    linestyles = ['-', '--', '-.', ':']
+    # reverse linestyles so the last algorithm (SPPDP) gets solid '-' by default
+    linestyles = list(reversed(linestyles))
+
+    mpl.rcParams.update({
+        'figure.figsize': (14, 5),
+        'axes.titlesize': 14,
+        'axes.labelsize': 12,
+        'legend.fontsize': 10,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'lines.linewidth': 2.2,
+    })
+
+    dt = modelparams.dt
+
+    fig, axs = plt.subplots(1, 3, figsize=(14, 5))
+
+    # Phase plot (position vs velocity)
+    ax = axs[0]
+    for i, (name, xbar, _, _) in enumerate(algorithms):
+        xb = np.asarray(xbar)
+        if xb.ndim == 1 or xb.shape[0] < 2:
+            continue
+        ax.plot(xb[:, 0], xb[:, 1], color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+    x0_np = np.asarray(x0)
+    xg_np = np.asarray(xg)
+    ax.scatter(x0_np[0], x0_np[1], color='red', s=60, marker='o', label='Start')
+    ax.scatter(xg_np[0], xg_np[1], color='green', s=80, marker='*', label='Goal')
+    ax.set_xlabel('Angular Position')
+    ax.set_ylabel('Angular Velocity')
+    ax.set_title('Phase Plot')
+    ax.legend(frameon=True)
+    ax.grid(alpha=0.45)
+
+    # Input vs time
+    ax2 = axs[1]
+    for i, (name, _, ubar, _) in enumerate(algorithms):
+        ub = np.asarray(ubar)
+        uvals = ub if ub.ndim == 1 else ub[:, 0]
+        t = np.arange(uvals.shape[0]) * dt
+        ax2.plot(t, uvals, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Input')
+    ax2.set_title('Input vs Time')
+    ax2.legend(frameon=True)
+    ax2.grid(alpha=0.45)
+
+    # Vstore (log scale)
+    ax3 = axs[2]
+    V_list = [np.asarray(Vstore) for (_, _, _, Vstore) in algorithms]
+    if len(V_list) == 0:
+        return
+    global_min = min([V.min() for V in V_list])
+    offset = 0.0
+    if global_min <= 0:
+        offset = 1e-12 - global_min
+    for i, (name, _, _, Vstore) in enumerate(algorithms):
+        V = np.asarray(Vstore) + offset
+        it = np.arange(len(V))
+        ax3.plot(it, V, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+    ax3.set_yscale('log')
+    ax3.set_xlabel('Iteration')
+    ax3.set_ylabel('Vstore')
+    ax3.set_title('Cost vs Iteration (log)')
+    ax3.legend(frameon=True)
+    ax3.grid(which='both', alpha=0.35)
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_compare_cartpole_results(algorithms, x0, xg, modelparams):
+    """
+    Compare multiple cartpole algorithms with a 2x2 figure:
+      (0,0) Position vs Velocity (phase)
+      (0,1) Pendulum Angle vs Angular Velocity (phase)
+      (1,0) Input vs Time
+      (1,1) Vstore vs Iterations (log scale)
+    algorithms: list of tuples (name, xbar, ubar, Vstore)
+      - xbar: array-like shape (T+1, 4)  (pos, vel, angpos, angvel)
+      - ubar: array-like shape (T, ) or (T, nu)
+      - Vstore: array-like of iteration costs
+    x0, xg: initial and goal states (length 4)
+    modelparams: object with .dt attribute
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import matplotlib as mpl
+    import seaborn as sns
+
+    sns.set_theme(style="darkgrid")
+    sns.set_context('notebook', font_scale=1.0)
+
+    n_alg = max(1, len(algorithms))
+    palette = sns.color_palette("flare", n_colors=n_alg)
+    colors = [palette[i % len(palette)] for i in range(len(algorithms))]
+    linestyles = list(reversed(['-', '--', '-.', ':']))
+
+    mpl.rcParams.update({
+        'figure.figsize': (14, 10),
+        'axes.titlesize': 14,
+        'axes.labelsize': 12,
+        'legend.fontsize': 10,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'lines.linewidth': 2.2,
+    })
+
+    dt = modelparams.dt
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+    # (0,0) Cart: position vs velocity
+    ax00 = axs[0, 0]
+    for i, (name, xbar, _, _) in enumerate(algorithms):
+        xb = np.asarray(xbar)
+        if xb.ndim == 1 or xb.shape[0] < 2:
+            continue
+        ax00.plot(xb[:, 0], xb[:, 1],
+                  color=colors[i],
+                  linestyle=linestyles[i % len(linestyles)],
+                  label=name)
+    x0_np = np.asarray(x0)
+    xg_np = np.asarray(xg)
+    ax00.scatter(x0_np[0], x0_np[1], color='red', s=60, marker='o', label='Start')
+    ax00.scatter(xg_np[0], xg_np[1], color='green', s=80, marker='*', label='Goal')
+    ax00.set_xlabel('Cart Position')
+    ax00.set_ylabel('Cart Velocity')
+    ax00.set_title('Cart: Position vs Velocity')
+    ax00.legend(frameon=True)
+    ax00.grid(alpha=0.45)
+
+    # (0,1) Pendulum: angle vs angular velocity
+    ax01 = axs[0, 1]
+    for i, (name, xbar, _, _) in enumerate(algorithms):
+        xb = np.asarray(xbar)
+        if xb.ndim == 1 or xb.shape[0] < 2:
+            continue
+        ax01.plot(xb[:, 2], xb[:, 3],
+                  color=colors[i],
+                  linestyle=linestyles[i % len(linestyles)],
+                  label=name)
+    ax01.scatter(x0_np[2], x0_np[3], color='red', s=60, marker='o', label='Start')
+    ax01.scatter(xg_np[2], xg_np[3], color='green', s=80, marker='*', label='Goal')
+    ax01.set_xlabel('Pendulum Angle')
+    ax01.set_ylabel('Angular Velocity')
+    ax01.set_title('Pendulum: Angle vs Angular Velocity')
+    ax01.legend(frameon=True)
+    ax01.grid(alpha=0.45)
+
+    # (1,0) Input vs time
+    ax10 = axs[1, 0]
+    for i, (name, _, ubar, _) in enumerate(algorithms):
+        ub = np.asarray(ubar)
+        uvals = ub if ub.ndim == 1 else ub[:, 0]
+        t = np.arange(uvals.shape[0]) * dt
+        ax10.plot(t, uvals, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+    ax10.set_xlabel('Time (s)')
+    ax10.set_ylabel('Input')
+    ax10.set_title('Input vs Time')
+    ax10.legend(frameon=True)
+    ax10.grid(alpha=0.45)
+
+    # (1,1) Vstore vs iterations (log)
+    ax11 = axs[1, 1]
+    V_list = [np.asarray(Vstore) for (_, _, _, Vstore) in algorithms]
+    if len(V_list) > 0:
+        global_min = min([V.min() for V in V_list])
+        offset = 0.0
+        if global_min <= 0:
+            offset = 1e-12 - global_min
+        for i, (name, _, _, Vstore) in enumerate(algorithms):
+            V = np.asarray(Vstore) + offset
+            it = np.arange(len(V))
+            ax11.plot(it, V, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+    ax11.set_yscale('log')
+    ax11.set_xlabel('Iteration')
+    ax11.set_ylabel('Vstore')
+    ax11.set_title('Cost vs Iteration (log)')
+    ax11.legend(frameon=True)
+    ax11.grid(which='both', alpha=0.35)
 
     plt.tight_layout()
     plt.show()

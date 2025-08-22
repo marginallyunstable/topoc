@@ -53,12 +53,10 @@ toprob = TOProblemDefinition(
 )
 
 # Define algorithm (example: DDP)
-algorithm = TOAlgorithm(AlgorithmName.DDP, gamma=0.01, beta=0.5, use_second_order_info=True)
+algorithm = TOAlgorithm(AlgorithmName.DDP, use_second_order_info=True)
 
 print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)
-print("Gamma:", algorithm.params.gamma)
-print("Beta:", algorithm.params.beta)
 print("Use second order info:", algorithm.params.use_second_order_info)
 
 tosolve = TOSolve(toprob, algorithm)

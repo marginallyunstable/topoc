@@ -39,7 +39,7 @@ params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
 # Define cost functions using partial
-dynamics = partial(block_on_ground_with_friction, params=params_dynamics)
+dynamics = partial(block_on_ground, params=params_dynamics)
 terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
 runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
 
@@ -59,15 +59,14 @@ algorithm = TOAlgorithm(
     gamma=0.01,
     beta=0.5,
     use_second_order_info=True,
-    sigma=10,
+    sigma=1e-2,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=49,
+    mcsamples=9,
     max_iters=50,
-    max_fi_iters=50
 )
 
 print("Algorithm parameters:")

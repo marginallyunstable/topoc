@@ -25,21 +25,21 @@ modelparams = ModelParams(
 
 # Define initial and goal states
 x0 = jnp.array([0.0, 0.0])
-xg = jnp.array([3.0, 0.0])
+xg = jnp.array([4.0, 0.0])
 # Define initial input (control)
 u0 = jnp.array([0.0])
 
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 0.01*jnp.eye(input_dim)
+R = 5*jnp.eye(input_dim)
 
 params_dynamics = {"m": 1.0, "dt": dt}
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
 # Define cost functions using partial
-dynamics = partial(block_on_ground_with_friction, params=params_dynamics)
+dynamics = partial(block_on_ground, params=params_dynamics)
 terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
 runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
 
@@ -56,19 +56,16 @@ toprob = TOProblemDefinition(
 # Define RDDP1 algorithm parameters (example values)
 algorithm = TOAlgorithm(
     AlgorithmName.RDDP1,
-    gamma=0.01,
-    beta=0.5,
-    use_second_order_info=False,
-    sigma_x=0.002,
-    sigma_u=10.0,
+    use_second_order_info=True,
+    sigma_x=1e-6,
+    sigma_u=1e-2,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=2000,
-    max_iters=200,
-    max_fi_iters=50
+    mcsamples=500,
+    max_iters=50,
 )
 
 print("Algorithm parameters:")

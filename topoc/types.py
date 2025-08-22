@@ -64,7 +64,7 @@ class AlgorithmParams:
                      max_iters: int = 200,
                      max_fi_iters: int = 50,
                      eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
-                     stopping_criteria: float = 1e-6):
+                     stopping_criteria: float = 1e-9):
             self.beta = beta
             self.gamma = gamma
             self.use_second_order_info = use_second_order_info
@@ -101,7 +101,10 @@ class AlgorithmParams:
                      sigma_red: float = 2.0,
                      targetalpha: float = 1e-6,
                      targetsigma: float = 1e-6,
-                     mcsamples: int = 50):
+                     mcsamples: int = 50,
+                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
+                     spg_params: dict = None,  # Parameters for the SPG method
+                     ):
             self.beta = beta
             self.gamma = gamma
             self.use_second_order_info = use_second_order_info
@@ -117,6 +120,8 @@ class AlgorithmParams:
             self.targetalpha = targetalpha  
             self.targetsigma = targetsigma
             self.mcsamples = mcsamples
+            self.spg_method = spg_method
+            self.spg_params = {"order": 5, **(spg_params or {})}
     class RDDP2Params:
         """
         RDDP2 Parameters
@@ -143,7 +148,10 @@ class AlgorithmParams:
                      sigma_red: float = 2.0,
                      targetalpha: float = 1e-6,
                      targetsigma: float = 1e-6,
-                     mcsamples: int = 50):
+                     mcsamples: int = 50,
+                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
+                     spg_params: dict = None,  # Parameters for the SPG method
+                     ):
             self.beta = beta
             self.gamma = gamma
             self.use_second_order_info = use_second_order_info
@@ -158,6 +166,8 @@ class AlgorithmParams:
             self.targetalpha = targetalpha  
             self.targetsigma = targetsigma
             self.mcsamples = mcsamples
+            self.spg_method = spg_method
+            self.spg_params = {"order": 5, **(spg_params or {})}
 
     class SPPDPParams:
         """

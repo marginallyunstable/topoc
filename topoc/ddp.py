@@ -74,7 +74,7 @@ class DDP():
             if regularization < 1e-6:
                 regularization = 0.0
 
-
+        
             Vprev = Vbar # Store previous value to check post forward iteration
 
             # xbar, ubar, Vbar, eps, done = forward_iteration(
@@ -92,9 +92,13 @@ class DDP():
             Vstore.append(Vbar)
             Change = Vprev - Vbar
 
-            if Change < self.toalgorithm.params.stopping_criteria or iter > self.toalgorithm.params.max_iters:
-                    print(f"Converged in {iter} iteration(s).")
-                    break
+            # if Change < self.toalgorithm.params.stopping_criteria or iter > self.toalgorithm.params.max_iters:
+            #     print(f"Converged in {iter} iteration(s).")
+            #     break
+
+            if iter > self.toalgorithm.params.max_iters:
+                print(f"Maximum iterations reached.")
+                break
 
         Result = namedtuple('Result', ['xbar', 'ubar', 'Vstore'])
         return Result(xbar=xbar, ubar=ubar, Vstore=Vstore)

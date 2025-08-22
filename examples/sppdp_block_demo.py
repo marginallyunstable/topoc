@@ -61,15 +61,14 @@ algorithm = TOAlgorithm(
     gamma=0.01,
     beta=0.5,
     spg_method='gh_ws',
-    spg_params={"order": 10},
+    spg_params={"order": 3},
     eta=0.01,
     lam=100,
     zeta=1,
     zeta_factor=2,
     zeta_min=1e-2,
-    sigma_u=30,
-    max_iters=200,
-    max_fi_iters=50
+    sigma_u=1e-2,
+    max_iters=50
 )
 
 print("Algorithm parameters:")

@@ -69,12 +69,17 @@ class RDDP1():
 
                 while not success:
 
-                    trajderivatives = state_input_smoothed_traj_batch_derivatives(
-                        xbar, ubar, self.toproblem,
-                        sigma_x=sigma_x,
-                        sigma_u=sigma_u,
-                        N_samples=self.toalgorithm.params.mcsamples,
-                        key=jax.random.PRNGKey(42)
+                    # trajderivatives = state_input_smoothed_traj_batch_derivatives(
+                    #     xbar, ubar, self.toproblem,
+                    #     sigma_x=sigma_x,
+                    #     sigma_u=sigma_u,
+                    #     N_samples=self.toalgorithm.params.mcsamples,
+                    #     key=jax.random.PRNGKey(42)
+                    # )
+                    trajderivatives = state_input_smoothed_traj_batch_derivatives_spm(
+                        xbar, ubar, 
+                        sigma_x,
+                        sigma_u, self.toproblem, self.toalgorithm,
                     )
                     dV, success, K, k, Vx, Vxx = backward_pass(trajderivatives,
                                                         regularization,
@@ -87,9 +92,8 @@ class RDDP1():
                 if regularization < 1e-6:
                     regularization = 0.0
 
-
                 Vprev = Vbar # Store previous value to check post forward iteration
-
+                
                 xbar, ubar, Vbar, eps, done = forward_iteration(
                     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm
                 )
@@ -117,8 +121,6 @@ class RDDP1():
                 print(f"Converged in {iter} iteration(s). [Outer Loop]")
                 break
 
-            
-            print(Vprev)
             
             print(f"Alpha set from {alpha} to {alpha / self.toalgorithm.params.alpha_red}")
             alpha = alpha / self.toalgorithm.params.alpha_red

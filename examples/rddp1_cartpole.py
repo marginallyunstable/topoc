@@ -57,7 +57,7 @@ algorithm = TOAlgorithm(
     AlgorithmName.RDDP1,
     gamma=0.01,
     beta=0.5,
-    use_second_order_info=False,
+    use_second_order_info=True,
     sigma_x=0.001,
     sigma_u=1e-2,
     alpha=0.1,
