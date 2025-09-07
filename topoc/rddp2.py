@@ -50,7 +50,7 @@ class RDDP2():
 
         # region: Algorithm Iterations
 
-        iter = 0
+        iter = 1
         Change = jnp.inf
         Vstore = [Vbar]
         regularization = 0.0
@@ -110,7 +110,7 @@ class RDDP2():
                     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm
                 )
 
-                if not done:
+                if not done or iter > self.toalgorithm.params.max_iters:
                     Vstore.append(Vprev)
                     print(f"Line Search exhausted. dV value expected was: {dV}")
                     break
@@ -125,7 +125,7 @@ class RDDP2():
             if (
                 (alpha <= self.toalgorithm.params.targetalpha and
                  sigma <= self.toalgorithm.params.targetsigma)
-                or iter == self.toalgorithm.params.max_iters
+                or iter > self.toalgorithm.params.max_iters
                 or Change <= self.toalgorithm.params.stopping_criteria
             ):
                 print(f"Converged in {iter} iteration(s). [Outer Loop]")

@@ -32,7 +32,7 @@ P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
 R = 1*jnp.eye(input_dim)
 
-params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 1.0, "dt": dt}
+params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 0.5, "dt": dt}
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 

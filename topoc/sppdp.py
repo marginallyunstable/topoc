@@ -37,6 +37,7 @@ class SPPDP():
         zeta_factor = self.toalgorithm.params.zeta_factor
         zeta_min = self.toalgorithm.params.zeta_min
         sigma_u = self.toalgorithm.params.sigma_u
+        use_second_order_info = self.toalgorithm.params.use_second_order_info
 
         # region: Initialize Simulation
     
@@ -50,17 +51,18 @@ class SPPDP():
         cov_policy_inv = (1/sigma_u) * jnp.broadcast_to(jnp.eye(Nu), (H-1, Nu, Nu))
 
         (xbar, ubar, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs), Vbar = forward_pass_wup(xbar, ubar, K, k, cov_policy, self.toproblem, self.toalgorithm)
-        # jax.debug.print("SPs: {sp}\nnX_SPs: {nxsp}", sp=SPs, nxsp=nX_SPs)
-        # jax.debug.print("Covs_Zs: {covs}\nchol_Covs_Zs: {chol_covs}", covs=Covs_Zs, chol_covs=chol_Covs_Zs)
+        # (xbar, ubar, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs), Vbar = forward_pass_wup_init(xbar, ubar, K, k, cov_policy, self.toproblem, self.toalgorithm)
         
         # endregion: Initialize Simulation
 
         # region: Algorithm Iterations
 
-        iter = 0
+        iter = 1
         Change = jnp.inf
         Vstore = [Vbar]
         regularization = 0.0
+        # call the initialization backward pass only once
+        first_backward = True
 
         while True:
 
@@ -75,17 +77,25 @@ class SPPDP():
 
                 while not success:
 
+                    # choose init-backward for the very first backward pass, otherwise use regular backward
+                    # back_fn = backward_pass_wup_init if first_backward else backward_pass_wup
+                    back_fn = backward_pass_wup
+
                     dV, success, K_new, k_new, V_new, Vx_new, Vxx_new, \
-                    cov_policy_new, cov_policy_inv_new = backward_pass_wup( xbar,ubar,
-                                                                            k, K, SPs, nX_SPs,
-                                                                            Covs_Zs, chol_Covs_Zs, zeta,
-                                                                            cov_policy, cov_policy_inv,
-                                                                            self.toproblem, self.toalgorithm,
-                                                                            regularization)
+                    cov_policy_new, cov_policy_inv_new = back_fn( xbar,ubar,
+                                                                    k, K, SPs, nX_SPs,
+                                                                    Covs_Zs, chol_Covs_Zs, zeta,
+                                                                    cov_policy, cov_policy_inv,
+                                                                    self.toproblem, self.toalgorithm,
+                                                                    regularization, use_second_order_info)
 
                     if not success:
                         regularization = max(regularization * 4, 1e-3)
                         print(f"Backward Pass failed. Setting regularization to: {regularization}")
+
+                # after a successful backward pass, mark that init has been used
+                if first_backward:
+                    first_backward = False
 
                 # Note: this doesn't need to be done for other algorithms, because others calculate k, K directly and not UPDATE it.
                 K = K_new
@@ -149,7 +159,9 @@ class SPPDP():
                 if True:
                     break
 
-            if (iter == self.toalgorithm.params.max_iters
+            print(f"Vprev: {Vprev}, Vbar: {Vbar}, Change: {Change}")
+            
+            if (iter > self.toalgorithm.params.max_iters
                 or abs(Change) <= self.toalgorithm.params.stopping_criteria
             ):
                 print(f"Maximum iterations reached/Converged in {iter} iteration(s).")
@@ -160,12 +172,12 @@ class SPPDP():
         return Result(xbar=xbar, ubar=ubar, Vstore=Vstore)
 
 
-                
-        
 
 
 
 
-        
+
+
+
 
 

@@ -56,8 +56,6 @@ toprob = TOProblemDefinition(
 # Define RDDP2 algorithm parameters (example values)
 algorithm = TOAlgorithm(
     AlgorithmName.RDDP2,
-    gamma=0.01,
-    beta=0.5,
     use_second_order_info=True,
     sigma=1e-2,
     alpha=0.1,
@@ -65,8 +63,10 @@ algorithm = TOAlgorithm(
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=9,
+    mcsamples=50,
     max_iters=50,
+    spg_method='g_ws',
+    spg_params={"order": 100},
 )
 
 print("Algorithm parameters:")

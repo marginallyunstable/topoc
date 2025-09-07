@@ -33,7 +33,7 @@ u0 = jnp.array([0.0])
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 5*jnp.eye(input_dim)
+R = 50*jnp.eye(input_dim)
 
 params_dynamics = {"m": 1.0, "dt": dt}
 params_terminal = {"P": P}
@@ -87,10 +87,9 @@ algorithm_rddp1 = TOAlgorithm(
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=100,
     max_iters=50,
-    spg_method='gh_ws',
-    spg_params={"order": 3},
+    spg_method='g_ws',
+    spg_params={"order": 27},
 )
 
 # Example usage: create and solve the problem with RDDP1
@@ -123,9 +122,8 @@ algorithm_rddp2 = TOAlgorithm(
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=50,
     max_iters=50,
-    spg_method='gh_ws',
+    spg_method='g_ws',
     spg_params={"order": 3},
 )
 
@@ -151,10 +149,11 @@ toprob_sppdp = TOProblemDefinition(
 # Define SPPDP algorithm parameters (example values)
 algorithm_sppdp = TOAlgorithm(
     AlgorithmName.SPPDP,
+    use_second_order_info=True,
     spg_method='gh_ws',
     spg_params={"order": 3},
     eta=0.01,
-    lam=100,
+    lam=1,
     zeta=1,
     zeta_factor=2,
     zeta_min=1e-2,
@@ -180,9 +179,9 @@ xbar_sppdp, ubar_sppdp, Vstore_sppdp = tosolve_sppdp.result.xbar, tosolve_sppdp.
 # recreate algorithms list and call the beautified plotting function
 algorithms = [
     ("DDP", xbar_ddp, ubar_ddp, Vstore_ddp),
-    ("RDDP1", xbar_rddp1, ubar_rddp1, Vstore_rddp1),
-    ("RDDP2", xbar_rddp2, ubar_rddp2, Vstore_rddp2),
-    ("SPPDP", xbar_sppdp, ubar_sppdp, Vstore_sppdp),
+    ("SCS-DDP", xbar_rddp1, ubar_rddp1, Vstore_rddp1),
+    ("CS-DDP", xbar_rddp2, ubar_rddp2, Vstore_rddp2),
+    ("P-PDP", xbar_sppdp, ubar_sppdp, Vstore_sppdp),
 ]
 
 plot_compare_block_results(algorithms, x0, xg, modelparams)

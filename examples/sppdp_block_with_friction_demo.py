@@ -33,7 +33,7 @@ u0 = jnp.array([0.0])
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 5*jnp.eye(input_dim)
+R = 50*jnp.eye(input_dim)
 
 params_dynamics = {"m": 1.0, "dt": dt}
 params_terminal = {"P": P}
@@ -58,9 +58,10 @@ toprob = TOProblemDefinition(
 # Define SPPDP algorithm parameters (example values)
 algorithm = TOAlgorithm(
     AlgorithmName.SPPDP,
+    use_second_order_info=True,
     spg_method='gh_ws',
     spg_params={"order": 10},
-    eta=0.001,
+    eta=0.01,
     lam=100,
     zeta=1,
     zeta_factor=2,

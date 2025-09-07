@@ -338,6 +338,453 @@ def forward_pass_wup(
 
         return (new_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs), total_cost
 
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def forward_pass_wup_mm(
+        Xs,
+        Us,
+        Ks,
+        ks,
+        cov_policy,
+        toproblem: "TOProblemDefinition",
+        toalgorithm: "TOAlgorithm",
+        eps: float = 1.0, # linear search parameter
+    ):
+    """
+    Perform a forward pass with uncertainty propagation.
+    """
+
+    dynamics = toproblem.dynamics
+    batched_dynamics = jax.vmap(dynamics)
+    runningcost = toproblem.runningcost
+    terminalcost = toproblem.terminalcost
+    xdim = toproblem.modelparams.state_dim
+    udim = toproblem.modelparams.input_dim
+    dt = toproblem.modelparams.dt
+    xini = toproblem.starting_state
+    cov_xini = toproblem.starting_state_cov
+    spg_func = get_spg_func(toalgorithm.params.spg_method)
+
+    wsp_r, usp_r = spg_func(xdim + udim, toalgorithm.params.spg_params)
+
+    # ------------------------------------------------------------------
+    # Moment-matched sample generator (keeps MC samples from blowing up)
+    # ------------------------------------------------------------------
+    def moment_matched_samples(key, mu, Sigma, N):
+        nz = mu.shape[0]
+        eps = jax.random.normal(key, (N, nz))
+        mu_s = eps.mean(axis=0, keepdims=True)
+        C_s = (eps - mu_s).T @ (eps - mu_s) / (N - 1)
+        Sigma, L = safe_cholesky_eig(Sigma)
+        C_s, Ls = safe_cholesky_eig(C_s)
+        A = L @ jax.scipy.linalg.solve_triangular(Ls, jnp.eye(nz), lower=True)
+        z0 = (eps - mu_s) @ A.T + mu
+        return z0
+
+    def dynamics_step(scan_state, scan_input):
+        (x, cov_x, traj_cost, rng_key), (x_bar, u_bar, K, k, cov_policy, t_idx) = scan_state, scan_input
+
+        delta_x = x - x_bar
+        delta_u = K @ delta_x + eps * k
+        u = u_bar + delta_u
+
+        cov_uu = cov_policy + K @ cov_x @ K.T
+        cov_ux = K @ cov_x
+
+        cov_z = jnp.block([
+            [cov_x, cov_ux.T],
+            [cov_ux, cov_uu]
+        ])
+        cov_z, chol_cov_z = safe_cholesky_eig(cov_z)
+
+        z = jnp.concatenate([x, u])
+
+        # --------------------------------------------------------------
+        # Replace sigma points with moment-matched MC samples
+        # --------------------------------------------------------------
+        N_mc = usp_r.shape[1] * 2  # e.g., 2x sigma-point count
+        rng_key, subkey = jax.random.split(rng_key)
+        samples = moment_matched_samples(subkey, z, cov_z, N_mc)
+        x_sigma_points = samples[:, :xdim]
+        u_sigma_points = samples[:, xdim:]
+
+        # propagate through dynamics
+        nx_sigma_points = batched_dynamics(x_sigma_points, u_sigma_points)
+        nx = nx_sigma_points.mean(axis=0)
+        ncov_x = (nx_sigma_points - nx).T @ (nx_sigma_points - nx) / (N_mc - 1)
+
+        traj_cost = traj_cost + dt * runningcost(x, u)
+
+        return (nx, ncov_x, traj_cost, rng_key), (nx, u, samples, nx_sigma_points, cov_z, chol_cov_z)
+
+    # initialize rng
+    rng_key = random.PRNGKey(42)
+
+    (xf, cov_xf, traj_cost, _), (new_next_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs) = lax.scan(
+        dynamics_step,
+        init=(xini, cov_xini, 0.0, rng_key),
+        xs=(Xs[:-1], Us, Ks, ks, cov_policy, jnp.arange(len(Us)))
+    )
+
+    total_cost = traj_cost + terminalcost(xf)
+    new_Xs = jnp.vstack([xini, new_next_Xs])
+
+    cov_xf, chol_cov_xf = safe_cholesky_eig(cov_xf)
+    pad_width = ((0, udim), (0, udim))
+    cov_xf_padded = jnp.pad(cov_xf, pad_width, mode='constant')
+    new_Covs_Zs = jnp.concatenate([new_Covs_Zs, cov_xf_padded[None, :, :]], axis=0)
+
+    chol_cov_xf_padded = jnp.pad(chol_cov_xf, pad_width, mode='constant')
+    new_chol_Covs_Zs = jnp.concatenate([new_chol_Covs_Zs, chol_cov_xf_padded[None, :, :]], axis=0)
+
+    return (new_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs), total_cost
+
+
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def forward_pass_wup_atv(
+        Xs: Array,
+        Us: Array,
+        Ks: Array,
+        ks: Array,
+        cov_policy: Array,
+        toproblem: "TOProblemDefinition",
+        toalgorithm: "TOAlgorithm",
+        eps: float = 1.0,  # line search parameter
+    ):
+    """
+    Same output/signature as `forward_pass_wup` but builds both + and - sigma points
+    for each Z = [x; u], then uses the combined set (positives + negatives) to compute
+    nx and ncov_x. The returned sigma-point arrays are the concatenation of + and - sets.
+    """
+    dynamics = toproblem.dynamics
+    batched_dynamics = jax.vmap(dynamics)
+    runningcost = toproblem.runningcost
+    terminalcost = toproblem.terminalcost
+    xdim = toproblem.modelparams.state_dim
+    udim = toproblem.modelparams.input_dim
+    dt = toproblem.modelparams.dt
+    xini = toproblem.starting_state
+    cov_xini = toproblem.starting_state_cov
+
+    spg_func = get_spg_func(toalgorithm.params.spg_method)
+    wsp_r, usp_r = spg_func(xdim + udim, toalgorithm.params.spg_params)  # (N_sigma,), (nz, N_sigma)
+    wsp_r = jnp.asarray(wsp_r)
+    usp_r = jnp.asarray(usp_r)
+
+    def dynamics_step(scan_state, scan_input):
+        x, cov_x, traj_cost = scan_state
+        x_bar, u_bar, K, k, cov_policy = scan_input
+
+        delta_x = x - x_bar
+        delta_u = K @ delta_x + eps * k
+        u = u_bar + delta_u
+
+        cov_uu = cov_policy + K @ cov_x @ K.T
+        cov_ux = K @ cov_x
+        # cov_uu = cov_policy # + K @  cov_x @ K.T
+        # cov_ux = jnp.zeros((udim, xdim), dtype=cov_x.dtype) # K @ cov_x
+
+        cov_z = jnp.block([
+            [cov_x, cov_ux.T],
+            [cov_ux, cov_uu]
+        ])  # shape (nz, nz)
+
+        cov_z, chol_cov_z = safe_cholesky_eig(cov_z)  # ensure PD
+
+        # build Z
+        z = jnp.concatenate([x, u])  # (nz,)
+
+        # + and - sigma points: (nz, N_sigma)
+        SPs_pos = z[:, None] + chol_cov_z @ usp_r
+        SPs_neg = z[:, None] - chol_cov_z @ usp_r
+
+        # transpose to (N_sigma, nz)
+        SPs_pos_T = SPs_pos.T
+        SPs_neg_T = SPs_neg.T
+
+        # split state/input
+        x_pos = SPs_pos_T[:, :xdim]
+        u_pos = SPs_pos_T[:, xdim:]
+        x_neg = SPs_neg_T[:, :xdim]
+        u_neg = SPs_neg_T[:, xdim:]
+
+        # propagate
+        nx_pos = batched_dynamics(x_pos, u_pos)  # (N_sigma, xdim)
+        nx_neg = batched_dynamics(x_neg, u_neg)  # (N_sigma, xdim)
+
+        # combine + and - sets
+        nx_sigma_points = jnp.concatenate([nx_pos, nx_neg], axis=0)      # (2*N_sigma, xdim)
+        sigma_points = jnp.concatenate([SPs_pos_T, SPs_neg_T], axis=0)  # (2*N_sigma, nz)
+
+        # combined weights normalized to sum=1: use wsp for each half and halve them
+        wsp_all = jnp.concatenate([wsp_r, wsp_r], axis=0)  # (2*N_sigma,)
+
+        # weighted mean and covariance over combined sigma points
+        nx = 0.5 * wsp_all @ nx_sigma_points                        # (xdim,)
+        dx = nx_sigma_points - nx                            # (2*N_sigma, xdim)
+        ncov_x = 0.5 * dx.T @ (wsp_all[:, None] * dx)              # (xdim, xdim)
+
+        # ncov_x = cov_x
+
+        traj_cost = traj_cost + dt * runningcost(x, u)
+
+        return (nx, ncov_x, traj_cost), (nx, u, sigma_points, nx_sigma_points, cov_z, chol_cov_z)
+
+    (xf, cov_xf, traj_cost), (new_next_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs) = lax.scan(
+        dynamics_step, init=(xini, cov_xini, 0.0), xs=(Xs[:-1], Us, Ks, ks, cov_policy)
+    )
+
+    total_cost = traj_cost + terminalcost(xf)
+    new_Xs = jnp.vstack([xini, new_next_Xs])
+
+    cov_xf, chol_cov_xf = safe_cholesky_eig(cov_xf)
+
+    pad_width = ((0, udim), (0, udim))  # pad nu zeros to bottom/right
+    cov_xf_padded = jnp.pad(cov_xf, pad_width, mode='constant')
+    new_Covs_Zs = jnp.concatenate([new_Covs_Zs, cov_xf_padded[None, :, :]], axis=0)
+
+    chol_cov_xf_padded = jnp.pad(chol_cov_xf, pad_width, mode='constant')
+    new_chol_Covs_Zs = jnp.concatenate([new_chol_Covs_Zs, chol_cov_xf_padded[None, :, :]], axis=0)
+
+    return (new_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs), total_cost
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def forward_pass_wup_atv_init(
+        Xs: Array,
+        Us: Array,
+        Ks: Array,
+        ks: Array,
+        cov_policy: Array,
+        toproblem: "TOProblemDefinition",
+        toalgorithm: "TOAlgorithm",
+        eps: float = 1.0,  # line search parameter
+    ):
+    """
+    Same output/signature as `forward_pass_wup` but builds both + and - sigma points
+    for each Z = [x; u], then uses the combined set (positives + negatives) to compute
+    nx and ncov_x. The returned sigma-point arrays are the concatenation of + and - sets.
+    """
+    dynamics = toproblem.dynamics
+    batched_dynamics = jax.vmap(dynamics)
+    runningcost = toproblem.runningcost
+    terminalcost = toproblem.terminalcost
+    xdim = toproblem.modelparams.state_dim
+    udim = toproblem.modelparams.input_dim
+    dt = toproblem.modelparams.dt
+    xini = toproblem.starting_state
+    cov_xini = toproblem.starting_state_cov
+
+    spg_func = get_spg_func(toalgorithm.params.spg_method)
+    wsp_r, usp_r = spg_func(xdim + udim, toalgorithm.params.spg_params)  # (N_sigma,), (nz, N_sigma)
+    wsp_r = jnp.asarray(wsp_r)
+    usp_r = jnp.asarray(usp_r)
+
+    def dynamics_step(scan_state, scan_input):
+        x, cov_x, traj_cost = scan_state
+        x_bar, u_bar, K, k, cov_policy = scan_input
+
+        delta_x = x - x_bar
+        delta_u = K @ delta_x + eps * k
+        u = u_bar + delta_u
+
+        # cov_uu = cov_policy + K @ cov_x @ K.T
+        # cov_ux = K @ cov_x
+        cov_uu = cov_policy # + K @  cov_x @ K.T
+        cov_ux = jnp.zeros((udim, xdim), dtype=cov_x.dtype) # K @ cov_x
+
+        cov_z = jnp.block([
+            [cov_x, cov_ux.T],
+            [cov_ux, cov_uu]
+        ])  # shape (nz, nz)
+
+        cov_z, chol_cov_z = safe_cholesky_eig(cov_z)  # ensure PD
+
+        # build Z
+        z = jnp.concatenate([x, u])  # (nz,)
+
+        # + and - sigma points: (nz, N_sigma)
+        SPs_pos = z[:, None] + chol_cov_z @ usp_r
+        SPs_neg = z[:, None] - chol_cov_z @ usp_r
+
+        # transpose to (N_sigma, nz)
+        SPs_pos_T = SPs_pos.T
+        SPs_neg_T = SPs_neg.T
+
+        # split state/input
+        x_pos = SPs_pos_T[:, :xdim]
+        u_pos = SPs_pos_T[:, xdim:]
+        x_neg = SPs_neg_T[:, :xdim]
+        u_neg = SPs_neg_T[:, xdim:]
+
+        # propagate
+        nx_pos = batched_dynamics(x_pos, u_pos)  # (N_sigma, xdim)
+        nx_neg = batched_dynamics(x_neg, u_neg)  # (N_sigma, xdim)
+
+        # combine + and - sets
+        nx_sigma_points = jnp.concatenate([nx_pos, nx_neg], axis=0)      # (2*N_sigma, xdim)
+        sigma_points = jnp.concatenate([SPs_pos_T, SPs_neg_T], axis=0)  # (2*N_sigma, nz)
+
+        # combined weights normalized to sum=1: use wsp for each half and halve them
+        wsp_all = jnp.concatenate([wsp_r, wsp_r], axis=0)  # (2*N_sigma,)
+
+        # weighted mean and covariance over combined sigma points
+        # nx = 0.5 * wsp_all @ nx_sigma_points                        # (xdim,)
+        nx = dynamics(x, u)
+        dx = nx_sigma_points - nx                            # (2*N_sigma, xdim)
+        # ncov_x = 0.5 * dx.T @ (wsp_all[:, None] * dx)              # (xdim, xdim)
+
+        ncov_x = cov_x
+
+        traj_cost = traj_cost + dt * runningcost(x, u)
+
+        return (nx, ncov_x, traj_cost), (nx, u, sigma_points, nx_sigma_points, cov_z, chol_cov_z)
+
+    (xf, cov_xf, traj_cost), (new_next_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs) = lax.scan(
+        dynamics_step, init=(xini, cov_xini, 0.0), xs=(Xs[:-1], Us, Ks, ks, cov_policy)
+    )
+
+    total_cost = traj_cost + terminalcost(xf)
+    new_Xs = jnp.vstack([xini, new_next_Xs])
+
+    cov_xf, chol_cov_xf = safe_cholesky_eig(cov_xf)
+
+    pad_width = ((0, udim), (0, udim))  # pad nu zeros to bottom/right
+    cov_xf_padded = jnp.pad(cov_xf, pad_width, mode='constant')
+    new_Covs_Zs = jnp.concatenate([new_Covs_Zs, cov_xf_padded[None, :, :]], axis=0)
+
+    chol_cov_xf_padded = jnp.pad(chol_cov_xf, pad_width, mode='constant')
+    new_chol_Covs_Zs = jnp.concatenate([new_chol_Covs_Zs, chol_cov_xf_padded[None, :, :]], axis=0)
+
+    return (new_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs), total_cost
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def forward_pass_wup_init(
+        Xs: Array,
+        Us: Array,
+        Ks: Array,
+        ks: Array,
+        cov_policy: Array,
+        toproblem: "TOProblemDefinition",
+        toalgorithm: "TOAlgorithm",
+        eps: float = 1.0, # linear search parameter
+    ):
+        """
+        Perform a forward pass with unncertainty propagation.
+
+        Parameters
+        ----------
+        Xs : Array
+            The target state trajectory.
+        Us : Array
+            The control trajectory.
+        Ks : Gains
+            The gains obtained from the Backward Pass.
+        dynamics : Callable
+            The dynamics function of the system.
+        runningcost : Callable
+            The running cost function.
+        finalcost : Callable
+            The final cost function.
+        eps : float, optional
+            The linesearch parameter, by default 1.0.
+
+        Returns
+        -------
+        [[NewStates, NewControls], TotalCost] -> Tuple[Tuple[Array, Array], float]
+            A tuple containing the updated state trajectory and control trajectory, and the total cost
+            of the trajectory.
+        """
+
+        dynamics = toproblem.dynamics
+        batched_dynamics = jax.vmap(dynamics)
+        runningcost = toproblem.runningcost
+        terminalcost = toproblem.terminalcost
+        xdim = toproblem.modelparams.state_dim
+        udim = toproblem.modelparams.input_dim
+        H = toproblem.modelparams.horizon_len
+        dt = toproblem.modelparams.dt
+        xini = toproblem.starting_state
+        cov_xini = toproblem.starting_state_cov
+        spg_func = gh_ws
+        base = int(round(toalgorithm.params.spg_params["order"] ** (1.0 / (xdim + udim))))
+        # spg_func = globals()[toalgorithm.params.spg_method]
+        
+        wsp_r, usp_r = spg_func(xdim + udim, {"order": base}) # sigma point weights (wsp_r) and unit sigma points (usp_r) for running part of trajectory
+ 
+        def dynamics_step(scan_state, scan_input):
+            x, cov_x, traj_cost = scan_state
+            x_bar, u_bar, K, k, cov_policy = scan_input
+
+            delta_x = x - x_bar
+            delta_u = K @ delta_x + eps * k
+            u = u_bar + delta_u
+
+            cov_uu = cov_policy + K @  cov_x @ K.T
+            cov_ux = K @ cov_x
+
+            cov_z = jnp.block([
+                [cov_x, cov_ux.T],
+                [cov_ux, cov_uu]
+            ]) # shape (nx + nu, nx + nu)
+
+            # chol_cov_z = jax.scipy.linalg.cholesky(cov_z, lower=True)
+            cov_z, chol_cov_z = safe_cholesky_eig(cov_z)  # Ensure positive definiteness
+            
+            
+            # jax.debug.print("cov_z: {}", cov_z)
+            # jax.debug.print("chol_cov_z: {}", chol_cov_z)
+            
+            # Generate sigma points
+            # Stack x and u together
+            z = jnp.concatenate([x, u])  # shape (nx + nu,)
+
+            # Generate sigma points: z + cov_z_sqrt @ usp_r
+            sigma_points = z[:, None] + chol_cov_z @ usp_r  # shape (nz, N_sigma)
+            sigma_points = sigma_points.T  # shape (N_sigma, nz)
+
+            x_sigma_points = sigma_points[:, :xdim]  # shape (N_sigma, nx)
+            u_sigma_points = sigma_points[:, xdim:]  # shape (N_sigma, nu)
+
+            # jax.debug.print("x_sigma_points: {}", x_sigma_points)
+            # jax.debug.print("u_sigma_points: {}", u_sigma_points)
+
+            # transported sigma points to state space through dynamics
+            nx_sigma_points = batched_dynamics(x_sigma_points, u_sigma_points) # shape (N_sigma, nx) 
+
+            nx = wsp_r @ nx_sigma_points  # shape (nx,)
+
+            # jax.debug.print("nx: {}", nx)
+
+            ncov_x = (nx_sigma_points - nx).T @ (wsp_r[:, None] * (nx_sigma_points - nx))  # shape (nx, nx)
+
+            traj_cost = traj_cost + dt * runningcost(x, u)
+
+            return (nx, ncov_x, traj_cost), (nx, u, sigma_points, nx_sigma_points, cov_z, chol_cov_z)
+
+        (xf, cov_xf, traj_cost), (new_next_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs) = lax.scan(
+            dynamics_step, init=(xini, cov_xini, 0.0), xs=(Xs[:-1], Us, Ks, ks, cov_policy)
+        )
+        
+        total_cost = traj_cost + terminalcost(xf)
+        new_Xs = jnp.vstack([xini, new_next_Xs])
+
+        # chol_cov_xf = jax.scipy.linalg.cholesky(cov_xf, lower=True)
+        cov_xf, chol_cov_xf = safe_cholesky_eig(cov_xf)  # Ensure positive definiteness
+        
+        
+        # jax.debug.print("cov_xf: {}", cov_xf)
+        # jax.debug.print("chol_cov_xf: {}", chol_cov_xf)
+        
+        pad_width = ((0, udim), (0, udim))  # pad nu zeros to bottom and right
+        cov_xf_padded = jnp.pad(cov_xf, pad_width, mode='constant')
+        new_Covs_Zs = jnp.concatenate([new_Covs_Zs, cov_xf_padded[None, :, :]], axis=0)  # shape (T+1, nx+nu, nx+nu)
+
+        
+        chol_cov_xf_padded = jnp.pad(chol_cov_xf, pad_width, mode='constant')
+        new_chol_Covs_Zs = jnp.concatenate([new_chol_Covs_Zs, chol_cov_xf_padded[None, :, :]], axis=0)  # shape (T+1, nx+nu, nx+nu)
+
+        return (new_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs), total_cost
+
 
 @partial(jax.jit, static_argnums=2)
 def backward_pass(
@@ -390,12 +837,19 @@ def backward_pass(
             def on_pd(L):
                 k = -jax.scipy.linalg.cho_solve((L, True), Qu)
                 K = -jax.scipy.linalg.cho_solve((L, True), Qux)
+
+                # jax.debug.print("k: {}", k)
+                # jax.debug.print("K: {}", K)
                 
                 V_x_new = Qx + K.T @ Quu @ k + K.T @ Qu + Qux.T @ k
                 V_xx_new = Qxx + K.T @ Quu @ K + K.T @ Qux + Qux.T @ K
                 # V_x_new = Qx + Qux.T @ k  # To use if Quu not regularized
                 # V_xx_new = Qxx + Qux.T @ K   # To use if Quu not regularized
                 dV_new = dV + Qu.T @ k # TODO: check this (eq 14 FHDDP paper)
+                
+                # jax.debug.print("Vx: {}", V_x_new)
+                # jax.debug.print("Vxx: {}", V_xx_new)
+                
                 return (dV_new, V_x_new, V_xx_new, True), (K, k, V_x_new, V_xx_new)
 
             def on_fail():
@@ -458,7 +912,7 @@ def backward_pass_wup(
     toproblem: "TOProblemDefinition",
     toalgorithm: "TOAlgorithm",
     reg: float = 0.0, # Regularization term for Quu
-    use_second_order_info: bool = False
+    use_second_order_info: bool = True
 ):
     """
     iLQR/DDP backward pass using JAX with regularization, Cholesky PD check,
@@ -507,7 +961,7 @@ def backward_pass_wup(
             qinfo = QInfo_wup(
                 Vxx, Vx, V,
                 nX, SPs, nX_SPs, chol_Cov,
-                runningcost, dt, wsp_r, usp_r,
+                runningcost, dt, wsp_r, usp_r, use_second_order_info = use_second_order_info
             )
             Q, Qx, Qu, Qxx, Qxu, Quu = qinfo
             
@@ -552,6 +1006,9 @@ def backward_pass_wup(
 
                 Vxx_new   = Qxx + (eta * K_.T @ Cov_policy_inv_ @ K_ - K.T @ Cov_policy_inv_reg @ K) / (lam)
                 Vx_new    = Qx  + (eta * K_.T @ Cov_policy_inv_ @ k_ - K.T @ Cov_policy_inv_reg @ k) / (lam)
+                # Vxx_new   = Qxx + -eta * ((K_.T @ Cov_policy_inv_ @ K_)/lam + K_.T @ Qxu.T + Qxu @ K_) + ((K.T @ Cov_policy_inv_reg @ K)/lam + K.T @ Qxu.T + Qxu @ K)
+                # Vx_new    = Qx  + -eta * ((K_.T @ Cov_policy_inv_ @ k_)/lam + K_.T @ Qu + Qxu @ k_) + ((K.T @ Cov_policy_inv_reg @ k)/lam + K.T @ Qu + Qxu @ k)
+                
                 # TODO: correct this see eqn 46a
                 V_new     = Q   + (eta * k_.T @ Cov_policy_inv_ @ k_ - k.T @ Cov_policy_inv_reg @ k) / (lam)
                 dV_new    = dV  + (eta * k_.T @ Cov_policy_inv_ @ k_ - k.T @ Cov_policy_inv_reg @ k) / (lam) # TODO: correct this
@@ -606,6 +1063,321 @@ def backward_pass_wup(
 
     return dV, success, K_seq, k_seq, V_seq, Vx_seq, Vxx_seq, Cov_policy_seq, Cov_policy_inv_seq    
 
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm", "use_second_order_info"))
+def backward_pass_wup_atv(
+    Xs,  # (N, Nx)
+    Us,  # (N-1, Nu)
+    ks, Ks, # Control gains
+    SPs,  # (2*N-1, Nsigma, Nx+Nu)
+    nX_SPs,  # (2*N-1, Nsigma, Nx)
+    Covs_Zs,  # (N-1, Nsigma, Nx+Nu, Nx+Nu)
+    chol_Covs_Zs,  # (N-1, Nsigma, Nx+Nu, Nx+Nu)
+    zeta,
+    Cov_policy,
+    Cov_policy_inv,
+    toproblem: "TOProblemDefinition",
+    toalgorithm: "TOAlgorithm",
+    reg: float = 0.0, # Regularization term for Quu
+    use_second_order_info: bool = True
+):
+    """
+    iLQR/DDP backward pass using JAX with regularization, Cholesky PD check,
+    and computation of expected cost decrease dV.
+    """
+
+    runningcost = toproblem.runningcost
+    terminalcost = toproblem.terminalcost
+    xdim = toproblem.modelparams.state_dim
+    udim = toproblem.modelparams.input_dim
+    dt = toproblem.modelparams.dt
+    lam_ = toalgorithm.params.lam
+    eta = toalgorithm.params.eta
+    spg_func = get_spg_func(toalgorithm.params.spg_method)
+    wsp_r, usp_r = spg_func(xdim + udim, toalgorithm.params.spg_params)
+    wsp_f, usp_f = spg_func(xdim, toalgorithm.params.spg_params)
+
+    # Terminal Step
+    lfxx, lfx, lf = VTerminalInfo_wup_atv(Xs[-1], chol_Covs_Zs[-1][:xdim, :xdim], terminalcost, wsp_f, usp_f)
+    
+    cZs = jnp.concatenate([Xs[:-1], Us], axis=1)
+
+    nXs = Xs[1:]
+    scaninputs = (cZs, nXs, SPs, nX_SPs, chol_Covs_Zs[:-1], Cov_policy, Cov_policy_inv, ks, Ks)
+    init_scanstate = (0.0, lf, lfx, lfxx, True)
+
+    def backward_step(scanstate, scaninput):
+        dV, V, Vx, Vxx, success = scanstate
+        cZ, nX, SPs, nX_SPs, chol_Cov, Cov_policy_, Cov_policy_inv_, k_, K_ = scaninput
+
+        def skip_step(_):
+            return (dV, V, Vx, Vxx, False), (K_, k_, V, Vx, Vxx, Cov_policy_, Cov_policy_inv_)
+
+        def compute_step(_):
+            qinfo = QInfo_wup_atv(
+                Vxx, Vx, V,
+                cZ, nX, SPs, nX_SPs, chol_Cov,
+                runningcost, dt, wsp_r, usp_r, use_second_order_info
+            )
+            Q, Qx, Qu, Qxx, Qxu, Quu = qinfo
+            n = Qxx.shape[0]
+            m = Quu.shape[0]
+
+            # jax.debug.print("Vx: {}", Vx)
+            # jax.debug.print("Vxx: {}", Vxx)
+            # jax.debug.print("Q: {}", Q)
+            # jax.debug.print("Qx: {}", Qx)
+            # jax.debug.print("Qu: {}", Qu)
+            # jax.debug.print("Qxx: {}", Qxx)
+            # jax.debug.print("Qux: {}", Qxu.T)
+            # jax.debug.print("Quu: {}", Quu)
+
+            lam = lam_*zeta
+            Cov_policy_inv_reg = eta * Cov_policy_inv_ + lam * Quu  + reg * jnp.eye(m)
+
+            def on_pd():
+                
+                X = jnp.eye(m)  # if you need the explicit inverse
+                Cov_policy_reg = jax.numpy.linalg.solve(Cov_policy_inv_reg, X)
+                k = Cov_policy_reg @ (eta * Cov_policy_inv_ @ k_ - lam * Qu)
+                K = Cov_policy_reg @ (eta * Cov_policy_inv_ @ K_ - lam * Qxu.T)
+
+                # jax.debug.print("k: {}", k)
+                # jax.debug.print("K: {}", K)
+
+
+                # Vxx_new   = Qxx + (eta * K_.T @ Cov_policy_inv_ @ K_ - K.T @ Cov_policy_inv_reg @ K) / (lam)
+                # Vx_new    = Qx  + (eta * K_.T @ Cov_policy_inv_ @ k_ - K.T @ Cov_policy_inv_reg @ k) / (lam)
+                # # TODO: correct this see eqn 46a
+                V_new     = Q   + (eta * k_.T @ Cov_policy_inv_ @ k_ - k.T @ Cov_policy_inv_reg @ k) / (lam)
+                dV_new    = dV  + (eta * k_.T @ Cov_policy_inv_ @ k_ - k.T @ Cov_policy_inv_reg @ k) / (lam) # TODO: correct this
+
+                # jax.debug.print("Vx: {}", Vx_new)
+                # jax.debug.print("Vxx: {}", Vxx_new)
+                
+            
+                Vxx_new   = Qxx + -eta * ((K_.T @ Cov_policy_inv_ @ K_)/lam + K_.T @ Qxu.T + Qxu @ K_) + ((K.T @ Cov_policy_inv_reg @ K)/lam + K.T @ Qxu.T + Qxu @ K)
+                Vx_new   = Qx  + -eta * ((K_.T @ Cov_policy_inv_ @ k_)/lam + K_.T @ Qu + Qxu @ k_) + ((K.T @ Cov_policy_inv_reg @ k)/lam + K.T @ Qu + Qxu @ k)
+                # # TODO: correct this see eqn 46a
+                # V_new     = Q   + (eta * (k_.T @ Cov_policy_inv_ @ k_) - (k.T @ Cov_policy_inv_reg @ k)) / (lam)
+                # dV_new    = dV  + (eta * (k_.T @ Cov_policy_inv_ @ k_) - (k.T @ Cov_policy_inv_reg @ k)) / (lam)
+                
+                # jax.debug.print("Vx_new: {}", Vx_new_)
+                # jax.debug.print("Vxx_new: {}", Vxx_new_)
+                
+                
+                return (dV_new, V_new, Vx_new, Vxx_new, True), (K, k, V_new, Vx_new, Vxx_new, Cov_policy_reg, Cov_policy_inv_reg)
+
+            def on_fail():
+                return (dV, V, Vx, Vxx, False), (K_, k_, V, Vx, Vxx, Cov_policy_, Cov_policy_inv_)
+
+            def try_chol_safe(Q_uu):
+                eps = 1e-9
+                Q_uu_test = Q_uu - eps * jnp.eye(m)
+                eigvals = jnp.linalg.eigvalsh(Q_uu_test)
+                is_pd = jnp.all(eigvals > 0.0)
+                L = jax.scipy.linalg.cholesky(Q_uu + 1e-9 * jnp.eye(m), lower=True)
+
+                # is_pd = True
+
+                return is_pd, L
+
+            is_pd, L = try_chol_safe(Cov_policy_inv_reg)
+            return lax.cond(
+                is_pd,
+                lambda _: on_pd(),
+                lambda _: on_fail(),
+                operand=None
+            )
+
+        return lax.cond(
+            success,
+            compute_step,
+            skip_step,
+            operand=None
+        )
+
+    (dV, V, Vx, Vxx, success), scan_outputs = lax.scan(
+        backward_step,
+        init=init_scanstate,
+        xs=scaninputs,
+        reverse=True
+    )
+
+    # Unpack and reverse outputs to forward-time order
+    K_seq_rev, k_seq_rev, V_seq_rev, Vx_seq_rev, Vxx_seq_rev, Cov_policy_seq_rev, Cov_policy_inv_seq_rev = scan_outputs
+    K_seq = K_seq_rev
+    k_seq = k_seq_rev
+    Cov_policy_seq = Cov_policy_seq_rev
+    Cov_policy_inv_seq = Cov_policy_inv_seq_rev
+    V_seq = jnp.concatenate([V_seq_rev, jnp.array([lf])], axis=0)
+    Vx_seq = jnp.concatenate([Vx_seq_rev, lfx[None, :]], axis=0)
+    Vxx_seq = jnp.concatenate([Vxx_seq_rev, lfxx[None, :, :]], axis=0)
+
+    return dV, success, K_seq, k_seq, V_seq, Vx_seq, Vxx_seq, Cov_policy_seq, Cov_policy_inv_seq
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm", "use_second_order_info"))
+def backward_pass_wup_init(
+    Xs,  # (N, Nx)
+    Us,  # (N-1, Nu)
+    ks, Ks, # Control gains
+    SPs,  # (N-1, Nsigma, Nx+Nu)
+    nX_SPs,  # (N-1, Nsigma, Nx)
+    Covs_Zs,  # (N-1, Nsigma, Nx+Nu, Nx+Nu)
+    chol_Covs_Zs,  # (N-1, Nsigma, Nx+Nu, Nx+Nu)
+    zeta,
+    Cov_policy,
+    Cov_policy_inv,
+    toproblem: "TOProblemDefinition",
+    toalgorithm: "TOAlgorithm",
+    reg: float = 0.0, # Regularization term for Quu
+    use_second_order_info: bool = True
+):
+    """
+    iLQR/DDP backward pass using JAX with regularization, Cholesky PD check,
+    and computation of expected cost decrease dV.
+    """
+
+    runningcost = toproblem.runningcost
+    terminalcost = toproblem.terminalcost
+    xdim = toproblem.modelparams.state_dim
+    udim = toproblem.modelparams.input_dim
+    dt = toproblem.modelparams.dt
+    lam_ = toalgorithm.params.lam
+    eta = toalgorithm.params.eta
+    spg_func = gh_ws
+    base = int(round(toalgorithm.params.spg_params["order"] ** (1.0 / (xdim + udim))))
+    wsp_r, usp_r = spg_func(xdim + udim, {"order": base})
+    wsp_f, usp_f = spg_func(xdim, {"order": base})
+
+    # jax.debug.print("wsp_r: {}", wsp_r)
+    # jax.debug.print("usp_r: {}", usp_r)
+    # jax.debug.print("wsp_f: {}", wsp_f)
+    # jax.debug.print("usp_f: {}", usp_f)
+
+    # Terminal Step
+    lfxx, lfx, lf = VTerminalInfo_wup(Xs[-1], chol_Covs_Zs[-1][:xdim, :xdim], terminalcost, wsp_f, usp_f)
+    # jax.debug.print("lf: {}", lf)
+    # jax.debug.print("lfx: {}", lfx)
+    # jax.debug.print("lfxx: {}", lfxx)
+
+    
+    nXs = Xs[1:]
+    scaninputs = (nXs, SPs, nX_SPs, chol_Covs_Zs[:-1], Cov_policy, Cov_policy_inv, ks, Ks)
+    init_scanstate = (0.0, lf, lfx, lfxx, True)
+
+    def backward_step(scanstate, scaninput):
+        dV, V, Vx, Vxx, success = scanstate
+        nX, SPs, nX_SPs, chol_Cov, Cov_policy_, Cov_policy_inv_, k_, K_ = scaninput
+        # jax.debug.print("V: {}", V)
+        # jax.debug.print("Vx: {}", Vx)
+        # jax.debug.print("Vxx: {}", Vxx)
+
+        def skip_step(_):
+            return (dV, V, Vx, Vxx, False), (K_, k_, V, Vx, Vxx, Cov_policy_, Cov_policy_inv_)
+
+        def compute_step(_):
+            qinfo = QInfo_wup(
+                Vxx, Vx, V,
+                nX, SPs, nX_SPs, chol_Cov,
+                runningcost, dt, wsp_r, usp_r, use_second_order_info
+            )
+            Q, Qx, Qu, Qxx, Qxu, Quu = qinfo
+            
+            # jax.debug.print("Q: {}", Q)
+            # jax.debug.print("Qx: {}", Qx)
+            # jax.debug.print("Qu: {}", Qu)
+            # jax.debug.print("Qxx: {}", Qxx)
+            # jax.debug.print("Qxu: {}", Qxu)
+            # jax.debug.print("Quu: {}", Quu)
+            n = Qxx.shape[0]
+            m = Quu.shape[0]
+
+            lam = lam_*zeta
+            Cov_policy_inv_reg = eta * Cov_policy_inv_ + lam * Quu  + reg * jnp.eye(m)
+            # Cov_policy_inv_reg = eta * Cov_policy_inv_ + lam * Quu  + zeta * jnp.eye(m)
+
+            def on_pd():
+                
+                X = jnp.eye(m)  # if you need the explicit inverse
+                Cov_policy_reg = jax.numpy.linalg.solve(Cov_policy_inv_reg, X)
+                k = Cov_policy_reg @ (eta * Cov_policy_inv_ @ k_ - lam * Qu)
+                K = Cov_policy_reg @ (eta * Cov_policy_inv_ @ K_ - lam * Qxu.T)
+
+                # jax.debug.print("k: {}", k)
+                # jax.debug.print("K: {}", K)
+                # jax.debug.print("Cov_policy_reg: {}", Cov_policy_reg)
+
+
+                # Cov_policy_inv_reg_, L = safe_cholesky_eig(Cov_policy_inv_reg)
+                # rhs_k  = eta * (Cov_policy_inv_ @ k_) - lam * Qu        # shape (..., m) or (..., m,1)
+                # k      = jax.scipy.linalg.cho_solve((L, True), rhs_k)                    # solves A x = rhs_k
+                # rhs_K  = eta * (Cov_policy_inv_ @ K_) - lam * Qxu.T     # shape (..., m, n)
+                # K      = jax.scipy.linalg.cho_solve((L, True), rhs_K)   
+
+                # Cov_policy_reg = jax.scipy.linalg.cho_solve((L, True), jnp.eye(m))
+                # Cov_policy_reg = 0.5 * (Cov_policy_reg + Cov_policy_reg.T)
+                # jax.debug.print("k: {}", k)
+                # jax.debug.print("K: {}", K)
+                # jax.debug.print("Cov_policy_reg: {}", Cov_policy_reg)
+
+
+
+                Vxx_new   = Qxx + -eta * ((K_.T @ Cov_policy_inv_ @ K_)/lam + K_.T @ Qxu.T + Qxu @ K_) + ((K.T @ Cov_policy_inv_reg @ K)/lam + K.T @ Qxu.T + Qxu @ K)
+                Vx_new   = Qx  + -eta * ((K_.T @ Cov_policy_inv_ @ k_)/lam + K_.T @ Qu + Qxu @ k_) + ((K.T @ Cov_policy_inv_reg @ k)/lam + K.T @ Qu + Qxu @ k)
+                # TODO: correct this see eqn 46a
+                V_new     = Q   + (eta * k_.T @ Cov_policy_inv_ @ k_ - k.T @ Cov_policy_inv_reg @ k) / (lam)
+                dV_new    = dV  + (eta * k_.T @ Cov_policy_inv_ @ k_ - k.T @ Cov_policy_inv_reg @ k) / (lam) # TODO: correct this
+
+                return (dV_new, V_new, Vx_new, Vxx_new, True), (K, k, V_new, Vx_new, Vxx_new, Cov_policy_reg, Cov_policy_inv_reg)
+
+            def on_fail():
+                return (dV, V, Vx, Vxx, False), (K_, k_, V, Vx, Vxx, Cov_policy_, Cov_policy_inv_)
+
+            def try_chol_safe(Q_uu):
+                eps = 1e-9
+                Q_uu_test = Q_uu - eps * jnp.eye(m)
+                eigvals = jnp.linalg.eigvalsh(Q_uu_test)
+                is_pd = jnp.all(eigvals > 0.0)
+                L = jax.scipy.linalg.cholesky(Q_uu + 1e-9 * jnp.eye(m), lower=True)
+
+                # is_pd = True
+
+                return is_pd, L
+
+            is_pd, L = try_chol_safe(Cov_policy_inv_reg)
+            return lax.cond(
+                is_pd,
+                lambda _: on_pd(),
+                lambda _: on_fail(),
+                operand=None
+            )
+
+        return lax.cond(
+            success,
+            compute_step,
+            skip_step,
+            operand=None
+        )
+
+    (dV, V, Vx, Vxx, success), scan_outputs = lax.scan(
+        backward_step,
+        init=init_scanstate,
+        xs=scaninputs,
+        reverse=True
+    )
+
+    # Unpack and reverse outputs to forward-time order
+    K_seq_rev, k_seq_rev, V_seq_rev, Vx_seq_rev, Vxx_seq_rev, Cov_policy_seq_rev, Cov_policy_inv_seq_rev = scan_outputs
+    K_seq = K_seq_rev
+    k_seq = k_seq_rev
+    Cov_policy_seq = Cov_policy_seq_rev
+    Cov_policy_inv_seq = Cov_policy_inv_seq_rev
+    V_seq = jnp.concatenate([V_seq_rev, jnp.array([lf])], axis=0)
+    Vx_seq = jnp.concatenate([Vx_seq_rev, lfx[None, :]], axis=0)
+    Vxx_seq = jnp.concatenate([Vxx_seq_rev, lfxx[None, :, :]], axis=0)
+
+    return dV, success, K_seq, k_seq, V_seq, Vx_seq, Vxx_seq, Cov_policy_seq, Cov_policy_inv_seq 
+
 @partial(jax.jit, static_argnums=2)
 def traj_batch_derivatives(
     Xs,  # (N, Nx)
@@ -630,6 +1402,7 @@ def traj_batch_derivatives(
     hessianrunningcost = toproblem.hessianrunningcost
     gradterminalcost = toproblem.gradterminalcost
     hessiantterminalcost = toproblem.hessiantterminalcost
+    dt = toproblem.modelparams.dt
     
     # Apply to Xs[:-1] and Us (first N elements)
     fxs, fus = jax.vmap(graddynamics)(Xs[:-1], Us)
@@ -637,6 +1410,12 @@ def traj_batch_derivatives(
 
     lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
     (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+    lxs = dt * lxs
+    lus = dt * lus
+    lxxs = dt * lxxs
+    lxus = dt * lxus
+    luxs = dt * luxs
+    luus = dt * luus
 
     # Terminal cost on last state (Xs[-1])
     lfx = gradterminalcost(Xs[-1])
@@ -681,6 +1460,7 @@ def input_smoothed_traj_batch_derivatives(
     hessianrunningcost = toproblem.hessianrunningcost
     gradterminalcost = toproblem.gradterminalcost
     hessiantterminalcost = toproblem.hessiantterminalcost
+    dt = toproblem.modelparams.dt
 
     # Prepare dynamics functions
     f = toproblem.dynamics
@@ -693,13 +1473,24 @@ def input_smoothed_traj_batch_derivatives(
         return input_smoothed_dynamics_derivatives(x, u, f, fx, fxx, key, sigma, N_samples)
 
     # Split key for each time step
-    keys = random.split(key, Us.shape[0])
+    keys = random.split(key, Us.shape[0]) 
+    
+    # # Don't Split key for each time step
+    # subkey = random.split(key, 1)[0]
+    # keys = jnp.tile(subkey, (Us.shape[0], 1)) 
+
     # Map over time steps
     fx_s, fxx_s, fu_s, fux_s, fuu_s = jax.vmap(smoothed_dyn_for_t)((Xs[:-1], Us, keys))
 
     # Cost derivatives as usual
     lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
     (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+    lxs = dt * lxs
+    lus = dt * lus
+    lxxs = dt * lxxs
+    lxus = dt * lxus
+    luxs = dt * luxs
+    luus = dt * luus
 
     # Terminal cost on last state (Xs[-1])
     lfx = gradterminalcost(Xs[-1])
@@ -743,6 +1534,7 @@ def input_smoothed_traj_batch_derivatives_qsim(
     hessianrunningcost = toproblem.hessianrunningcost
     gradterminalcost = toproblem.gradterminalcost
     hessiantterminalcost = toproblem.hessiantterminalcost
+    dt = toproblem.modelparams.dt
 
 
     fx_s, fu_s = graddynamics(Xs[:-1], Us, jnp.sqrt(sigma), N_samples)
@@ -758,6 +1550,12 @@ def input_smoothed_traj_batch_derivatives_qsim(
     # Cost derivatives as usual
     lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
     (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+    lxs = dt * lxs
+    lus = dt * lus
+    lxxs = dt * lxxs
+    lxus = dt * lxus
+    luxs = dt * luxs
+    luus = dt * luus
 
     # Terminal cost on last state (Xs[-1])
     lfx = gradterminalcost(Xs[-1])
@@ -805,6 +1603,7 @@ def input_smoothed_traj_chunked_batch_derivatives_qsim(
     hessianrunningcost = toproblem.hessianrunningcost
     gradterminalcost = toproblem.gradterminalcost
     hessiantterminalcost = toproblem.hessiantterminalcost
+    dt = toproblem.modelparams.dt
 
     N = int(Xs.shape[0])
     Nx = int(Xs.shape[1])
@@ -846,6 +1645,12 @@ def input_smoothed_traj_chunked_batch_derivatives_qsim(
     # Cost derivatives as usual
     lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
     (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+    lxs = dt * lxs
+    lus = dt * lus
+    lxxs = dt * lxxs
+    lxus = dt * lxus
+    luxs = dt * luxs
+    luus = dt * luus
 
     # Terminal cost on last state (Xs[-1])
     lfx = gradterminalcost(Xs[-1])
@@ -926,7 +1731,8 @@ def input_smoothed_traj_batch_derivatives_spm(
     Us,  # (N-1, Nu)
     sigma,
     toproblem: "TOProblemDefinition",
-    toalgorithm: "TOAlgorithm"
+    toalgorithm: "TOAlgorithm",
+    seed: int = 0,
 ):
     """
     Compute all derivatives for a trajectory using input_smoothed_dynamics_derivatives for dynamics part.
@@ -942,13 +1748,37 @@ def input_smoothed_traj_batch_derivatives_spm(
     spg_func = get_spg_func(toalgorithm.params.spg_method)
     xdim = toproblem.modelparams.state_dim
     udim = toproblem.modelparams.input_dim
-    wsp, usp = spg_func(udim, toalgorithm.params.spg_params)
+    dt = toproblem.modelparams.dt
+    # wsp, usp = spg_func(udim, toalgorithm.params.spg_params)
     cov_diag = jnp.concatenate([jnp.full((udim,), sigma)])
     cov_matrix = jnp.diag(cov_diag)
     _, chol_Cov_U = safe_cholesky_eig(cov_matrix)
 
     Zs = jnp.concatenate([Xs[:-1], Us], axis=1)  # shape (N-1, Nx+Nu)
 
+    # prepare per-step keys and vmap the sigma-point generator to produce distinct wsp/usp per step
+    Tm1 = Zs.shape[0]
+    base_key = random.PRNGKey(int(seed))
+    keys = random.split(base_key, Tm1)
+
+    spg_params = toalgorithm.params.spg_params if hasattr(toalgorithm.params, "spg_params") else toalgorithm.params.spg_params
+
+    def spg_call(key):
+        # Prefer to pass params as a dict with key so stochastic generators use it.
+        if isinstance(spg_params, dict):
+            params_with_key = dict(spg_params)
+            params_with_key["key"] = key
+            wsp, usp = spg_func(udim, params_with_key)
+        else:
+            # fallback: try to call with params directly (deterministic SPG will ignore key)
+            try:
+                wsp, usp = spg_func(udim, spg_params)
+            except Exception:
+                wsp, usp = spg_func(udim, {"key": key})
+        return jnp.asarray(wsp), jnp.asarray(usp)
+
+    # vmapped generator: wsp_seq shape (T-1, N_sigma), usp_seq shape (T-1, nz, N_sigma)
+    wsp_seq, usp_seq = jax.vmap(spg_call)(keys)
     
     # Get cost derivatives as usual
     gradrunningcost = toproblem.gradrunningcost
@@ -961,21 +1791,49 @@ def input_smoothed_traj_batch_derivatives_spm(
     fx = jax.jacrev(f, argnums=0)
     fxx = jax.hessian(f, argnums=0)
 
-    def calc_smoothed_dynamics_derivatives(Zs):
+    def calc_smoothed_dynamics_derivatives(Zs, wsp, usp):
+
         Us = Zs[xdim:]
         SPs = Us[:, None] + chol_Cov_U @ usp  # shape (nu, N_sigma)
+        N_sigma = usp.shape[1]
+        # Build xs as repeated nominal state for each sigma point: shape (N_sigma, xdim)
+        xs = jnp.tile(Zs[:xdim][None, :], (N_sigma, 1))
         us = SPs.T  # shape (N_sigma, nu)
-        # xs = jnp.repeat(Zs[:xdim][None, :], us.shape[0], axis=0)  # shape (N_sigma, nx)
-        # N = SPs.shape[0]  # number of sigma points (length of first dimension of SPs)
+        nSPs = Us[:, None] - chol_Cov_U @ usp  # shape (nu, N_sigma)
+        nxs = xs
+        nus = nSPs.T  # shape (N_sigma, nu)
         f_plus = jax.vmap(lambda up: f(Zs[:xdim], up))(us)  # [N, Nx]
-        
+        f_minus = jax.vmap(lambda up: f(Zs[:xdim], up))(nus)  # [N, Nx]
+        f0 = f(Zs[:xdim], Zs[xdim:])  # [Nx]
+
         fx_plus = jax.vmap(lambda up: fx(Zs[:xdim], up))(us)  # [N, Nx, Nx]
-        fx_s = jnp.einsum('n,nij->ij', wsp, fx_plus)
-        fxx_plus = jax.vmap(lambda up: fxx(Zs[:xdim], up))(us)  # [N, Nx, Nx, Nx]
-        fxx_s = jnp.einsum('n,nijk->ijk', wsp, fxx_plus)
+        fx_minus = jax.vmap(lambda up: fx(Zs[:xdim], up))(nus)  # [N, Nx, Nx]
+        fx_mean = 0.5 * (fx_plus + fx_minus)
+        fx_diff = 0.5 * (fx_plus - fx_minus)
+        fx_s = jnp.einsum('n,nij->ij', wsp, fx_mean)
+        # fx_s = jnp.einsum('n,nij->ij', wsp, fx_plus)
+        # fx_s = fx(Zs[:xdim], Zs[xdim:])
+
+        f_plus_mean = wsp @ f_plus  # weighted mean of f_plus over sigma points
+        f_minus_mean = wsp @ f_minus  # weighted mean of f_minus over sigma points
+        xs_all = jnp.concatenate([xs, nxs], axis=0)        # (2*N_sigma, Nx)
+        us_all = jnp.concatenate([us, nus], axis=0)        # (2*N_sigma, Nu)
+        f_all  = jnp.concatenate([f_plus, f_minus], axis=0) # (2*N_sigma, Nx)
+        w_all  = jnp.concatenate([wsp, wsp], axis=0)       # (2*N_sigma,)
+
+        f_all_mean = 0.5 * w_all @ f_all
+        _, fu_s = calc_AB_lstsq(xs_all, us_all, f_all, f_all_mean, Zs[:xdim], Zs[xdim:])
+        # _, fu_s = calc_AB_lstsq(xs, us, f_plus, f_plus_mean, Zs[:xdim], Zs[xdim:])
+
         
-        # f_plus_mean = wsp @ f_plus
-        # fx_s, fu_s = calc_AB_lstsq(xs, us, f_plus, f_plus_mean, Zs[:xdim], Zs[xdim:])
+        fxx_plus = jax.vmap(lambda up: fxx(Zs[:xdim], up))(us)  # [N, Nx, Nx, Nx]
+        fxx_minus = jax.vmap(lambda up: fxx(Zs[:xdim], up))(nus)  # [N, Nx, Nx, Nx]
+        fxx_0 = fxx(Zs[:xdim], Zs[xdim:])  # [Nx, Nx, Nx]
+        fxx_mean = 0.5 * (fxx_plus + fxx_minus - 2*fxx_0)
+        fxx_diff = 0.5 * (fxx_plus - fxx_minus)
+        fxx_s = jnp.einsum('n,nijk->ijk', wsp, fxx_mean)
+        # fxx_s = jnp.einsum('n,nijk->ijk', wsp, fxx_plus)
+        # fxx_s = fxx(Zs[:xdim], Zs[xdim:])
 
         usp_ = usp.T
         eps_outer = usp_[:, :, None] * usp_[:, None, :]  # [N, Nx+Nu, Nx+Nu
@@ -983,22 +1841,30 @@ def input_smoothed_traj_batch_derivatives_spm(
         L_inv = jax.scipy.linalg.solve_triangular(chol_Cov_U, jnp.eye(chol_Cov_U.shape[0]), lower=True)
         # transform eps_outer into the unit/sigma basis: L^{-1} @ e @ L^{-T}
         eps_outer_transformed = jax.vmap(lambda e: L_inv.T @ e @ L_inv)(eps_outer)
-        # fzz_s = jnp.einsum('nd,nij->dij', f_plus, eps_outer_transformed) / N  # [Nx, Nx+Nu, Nx+Nu]
-        fuu_s = jnp.einsum('n,nd,nij->dij', wsp, f_plus, eps_outer_transformed) # [Nx, Nx+Nu, Nx+Nu]
+        fuu_s = jnp.einsum('n,nd,nij->dij', wsp, (f_plus + f_minus - 2 * f0)/2, eps_outer_transformed) # [Nx, Nx+Nu, Nx+Nu]
+        # fuu_s = jnp.einsum('n,nd,nij->dij', wsp, f_plus, eps_outer_transformed) # [Nx, Nx+Nu, Nx+Nu]
         
         eps = usp_
         eps_transformed = jax.vmap(lambda e: L_inv @ e)(eps)
-        fu_s = jnp.einsum('n,ni,nj->ij', wsp, f_plus, eps_transformed)
-        fux_s = jnp.einsum('n,nij,nk->ikj', wsp, fx_plus, eps_transformed)
+        # fu_s = jnp.einsum('n,ni,nj->ij', wsp, (f_plus-f_minus)/2, eps_transformed)
+        fux_s = jnp.einsum('n,nij,nk->ikj', wsp, (fx_plus-fx_minus)/2, eps_transformed)
+        # fu_s = jnp.einsum('n,ni,nj->ij', wsp, f_plus, eps_transformed)
+        # fux_s = jnp.einsum('n,nij,nk->ikj', wsp, fx_plus, eps_transformed)
 
 
         return fx_s, fu_s, fxx_s, fux_s, fuu_s
 
-    fx_s, fu_s, fxx_s, fux_s, fuu_s = jax.vmap(calc_smoothed_dynamics_derivatives)(Zs)
+    fx_s, fu_s, fxx_s, fux_s, fuu_s = jax.vmap(calc_smoothed_dynamics_derivatives)(Zs, wsp_seq, usp_seq)
 
     # Cost derivatives as usual
     lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
     (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+    lxs = dt * lxs
+    lus = dt * lus
+    lxxs = dt * lxxs
+    lxus = dt * lxus
+    luxs = dt * luxs
+    luus = dt * luus
 
     # Terminal cost on last state (Xs[-1])
     lfx = gradterminalcost(Xs[-1])
@@ -1044,6 +1910,7 @@ def state_input_smoothed_traj_batch_derivatives(
     hessianrunningcost = toproblem.hessianrunningcost
     gradterminalcost = toproblem.gradterminalcost
     hessiantterminalcost = toproblem.hessiantterminalcost
+    dt = toproblem.modelparams.dt
 
     # Prepare dynamics functions
     f = toproblem.dynamics
@@ -1054,13 +1921,24 @@ def state_input_smoothed_traj_batch_derivatives(
         return state_input_smoothed_dynamics_derivatives(x, u, f, key, sigma_x, sigma_u, N_samples)
 
     # Split key for each time step
-    keys = random.split(key, Us.shape[0])
+    keys = random.split(key, Us.shape[0]) 
+    
+    # # Don't Split key for each time step
+    # subkey = random.split(key, 1)[0]
+    # keys = jnp.tile(subkey, (Us.shape[0], 1)) 
+
     # Map over time steps
     fx_s, fxx_s, fu_s, fux_s, fuu_s = jax.vmap(smoothed_dyn_for_t)((Xs[:-1], Us, keys))
 
     # Cost derivatives as usual
     lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
     (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+    lxs = dt * lxs
+    lus = dt * lus
+    lxxs = dt * lxxs
+    lxus = dt * lxus
+    luxs = dt * luxs
+    luus = dt * luus
 
     # Terminal cost on last state (Xs[-1])
     lfx = gradterminalcost(Xs[-1])
@@ -1146,6 +2024,7 @@ def state_input_smoothed_traj_batch_derivatives_spm(
     sigma_u,
     toproblem: "TOProblemDefinition",
     toalgorithm: "TOAlgorithm",
+    seed: int = 0,
 ):
     """
     Compute all derivatives for a trajectory using state_input_smoothed_dynamics_derivatives for dynamics part.
@@ -1161,12 +2040,42 @@ def state_input_smoothed_traj_batch_derivatives_spm(
     spg_func = get_spg_func(toalgorithm.params.spg_method)
     xdim = toproblem.modelparams.state_dim
     udim = toproblem.modelparams.input_dim
-    wsp, usp = spg_func(xdim + udim, toalgorithm.params.spg_params)
+    dt = toproblem.modelparams.dt
+    nz = xdim + udim
+    # wsp, usp = spg_func(xdim + udim, toalgorithm.params.spg_params)
     cov_diag = jnp.concatenate([jnp.full((xdim,), sigma_x), jnp.full((udim,), sigma_u)])
     cov_matrix = jnp.diag(cov_diag)
     _, chol_Cov_Z = safe_cholesky_eig(cov_matrix)
 
+    # jax.debug.print("chol_Cov_Z = {}", chol_Cov_Z)
+
     Zs = jnp.concatenate([Xs[:-1], Us], axis=1)  # shape (N-1, Nx+Nu)
+
+    # prepare per-step keys and vmap the sigma-point generator to produce distinct wsp/usp per step
+    Tm1 = Zs.shape[0]
+    base_key = random.PRNGKey(int(seed))
+    keys = random.split(base_key, Tm1)
+
+    spg_params = toalgorithm.params.spg_params if hasattr(toalgorithm.params, "spg_params") else toalgorithm.params.spg_params
+
+    def spg_call(key):
+        # Prefer to pass params as a dict with key so stochastic generators use it.
+        if isinstance(spg_params, dict):
+            params_with_key = dict(spg_params)
+            params_with_key["key"] = key
+            wsp, usp = spg_func(nz, params_with_key)
+        else:
+            # fallback: try to call with params directly (deterministic SPG will ignore key)
+            try:
+                wsp, usp = spg_func(nz, spg_params)
+            except Exception:
+                wsp, usp = spg_func(nz, {"key": key})
+        return jnp.asarray(wsp), jnp.asarray(usp)
+
+    # vmapped generator: wsp_seq shape (T-1, N_sigma), usp_seq shape (T-1, nz, N_sigma)
+    wsp_seq, usp_seq = jax.vmap(spg_call)(keys)
+    # jax.debug.print("wsp_seq = {}", wsp_seq)
+    # jax.debug.print("usp_seq = {}", usp_seq)
 
     # Get cost derivatives as usual
     gradrunningcost = toproblem.gradrunningcost
@@ -1177,36 +2086,65 @@ def state_input_smoothed_traj_batch_derivatives_spm(
     # Prepare dynamics functions
     f = toproblem.dynamics
 
-    def calc_smoothed_dynamics_derivatives(Zs):
-
+    def calc_smoothed_dynamics_derivatives(Zs, wsp, usp):
+        
         SPs = Zs[:, None] + chol_Cov_Z @ usp  # shape (nz, N_sigma)
         SPs = SPs.T  # shape (N_sigma, nz)
-        # N = SPs.shape[0]  # number of sigma points (length of first dimension of SPs)
+        nSPs = Zs[:, None] - chol_Cov_Z @ usp  # shape (nz, N_sigma)
+        nSPs = nSPs.T  # shape (N_sigma, nz)
         xs = SPs[:, :xdim]  # shape (N_sigma, Nx)
         us = SPs[:, xdim:]  # shape (N_sigma, Nu)
+        nxs = nSPs[:, :xdim]  # shape (N_sigma, Nx)
+        nus = nSPs[:, xdim:]  # shape (N_sigma, Nu)
         f_plus = jax.vmap(lambda xp, up: f(xp, up))(xs, us)  # [N, Nx]
+        f_minus = jax.vmap(lambda xp, up: f(xp, up))(nxs, nus)  # [N, Nx]
+        f0 = f(Zs[:xdim], Zs[xdim:])  # [Nx]
         f_plus_mean = wsp @ f_plus  # weighted mean of f_plus over sigma points
-        fx_s, fu_s = calc_AB_lstsq(xs, us, f_plus, f_plus_mean, Zs[:xdim], Zs[xdim:])
+        f_minus_mean = wsp @ f_minus  # weighted mean of f_minus over sigma points
+        xs_all = jnp.concatenate([xs, nxs], axis=0)        # (2*N_sigma, Nx)
+        us_all = jnp.concatenate([us, nus], axis=0)        # (2*N_sigma, Nu)
+        f_all  = jnp.concatenate([f_plus, f_minus], axis=0) # (2*N_sigma, Nx)
+        w_all  = jnp.concatenate([wsp, wsp], axis=0)       # (2*N_sigma,)
+
+        f_all_mean = 0.5 * w_all @ f_all
+        fx_s, fu_s = calc_AB_lstsq(xs_all, us_all, f_all, f_all_mean, Zs[:xdim], Zs[xdim:])
+        # fx_s, fu_s = calc_AB_lstsq(xs, us, f_plus, f_plus_mean, Zs[:xdim], Zs[xdim:])
 
         usp_ = usp.T
+        
         eps_outer = usp_[:, :, None] * usp_[:, None, :]  # [N, Nx+Nu, Nx+Nu]
         eps_outer = eps_outer - jnp.eye(xdim + udim)[None, :, :]  # [N, Nx+Nu, Nx+Nu]
         L_inv = jax.scipy.linalg.solve_triangular(chol_Cov_Z, jnp.eye(chol_Cov_Z.shape[0]), lower=True)
+        
+        eps_transformed = jax.vmap(lambda e: L_inv @ e)(usp_)
+        # fz_s = jnp.einsum('n,ni,nj->ij', wsp, f_plus, eps_transformed)
+        # # fz_s = jnp.einsum('n,ni,nj->ij', wsp, (f_plus-f_minus)/2, eps_transformed)
+        
+        # fx_s = fz_s[:, :xdim]  # [Nx, Nx]
+        # fu_s = fz_s[:, xdim:]  # [Nx, Nu]
+        
+        
         # transform eps_outer into the unit/sigma basis: L^{-1} @ e @ L^{-T}
         eps_outer_transformed = jax.vmap(lambda e: L_inv.T @ e @ L_inv)(eps_outer)
-        # fzz_s = jnp.einsum('nd,nij->dij', f_plus, eps_outer_transformed) / N  # [Nx, Nx+Nu, Nx+Nu]
-        fzz_s = jnp.einsum('n,nd,nij->dij', wsp, f_plus, eps_outer_transformed) # [Nx, Nx+Nu, Nx+Nu]
+        # fzz_s = jnp.einsum('n,nd,nij->dij', wsp, f_plus, eps_outer_transformed) # [Nx, Nx+Nu, Nx+Nu]
+        fzz_s = jnp.einsum('n,nd,nij->dij', wsp, (f_plus + f_minus - 2 * f0)/2, eps_outer_transformed) # [Nx, Nx+Nu, Nx+Nu]
         fxx_s = fzz_s[:, :xdim, :xdim]  # [Nx, Nx, Nx]
         fux_s = fzz_s[:, xdim:, :xdim]  # [Nx, Nu, Nx]
         fuu_s = fzz_s[:, xdim:, xdim:]  # [Nu, Nu, Nu]
 
         return fx_s, fu_s, fxx_s, fux_s, fuu_s
 
-    fx_s, fu_s, fxx_s, fux_s, fuu_s = jax.vmap(calc_smoothed_dynamics_derivatives)(Zs)
+    fx_s, fu_s, fxx_s, fux_s, fuu_s = jax.vmap(calc_smoothed_dynamics_derivatives)(Zs, wsp_seq, usp_seq)
 
     # Cost derivatives as usual
     lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
     (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+    lxs = dt * lxs
+    lus = dt * lus
+    lxxs = dt * lxxs
+    lxus = dt * lxus
+    luxs = dt * luxs
+    luus = dt * luus
 
     # Terminal cost on last state (Xs[-1])
     lfx = gradterminalcost(Xs[-1])
@@ -1219,6 +2157,57 @@ def state_input_smoothed_traj_batch_derivatives_spm(
         lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
         lfx=lfx, lfxx=lfxx
     )
+
+@partial(jax.jit, static_argnames=("terminalcost", "wsp", "usp"))
+def VTerminalInfo_wup_atv(
+    x_f,        # (1, Nx) or (Nx,)
+    chol_cov,   # (Nx, Nx)
+    terminalcost,
+    wsp, usp,
+):
+    # ensure 1-D state vector
+    x_ref = jnp.ravel(x_f)        # (Nx,)
+    xdim = x_f.shape[0]
+
+    # build sigma points
+    usp_ = usp.T                          # (N_sigma, xdim)
+    SPs = x_ref[:, None] + chol_cov @ usp # (xdim, N_sigma)
+    xs = SPs.T                            # (N_sigma, xdim)
+    nSPs = x_ref[:, None] - chol_cov @ usp
+    nxs = nSPs.T                          # (N_sigma, xdim)
+
+    # terminalcost -> scalar per sample
+    V_f_plus = jax.vmap(lambda xp: terminalcost(xp))(xs)    # (N_sigma,)
+    V_f_minus = jax.vmap(lambda xp: terminalcost(xp))(nxs)  # (N_sigma,)
+    V_f_0 = terminalcost(x_ref)                     # scalar
+
+    # combined stacked arrays
+    xs_all = jnp.concatenate([xs, nxs], axis=0)            # (2*N, xdim)
+    V_f_all = jnp.concatenate([V_f_plus, V_f_minus], axis=0)  # (2*N,)
+    
+    # weighted mean over both + and - sets (average of the two weighted means)
+    V_f_all_mean = 0.5 * (wsp @ V_f_plus + wsp @ V_f_minus)   # scalar
+    V_f = V_f_all_mean
+
+    # compute gradient (Nx,) using scalar least-squares helper
+    Vx_f = calc_A_lstsq(xs_all, V_f_all, V_f_all_mean, x_ref)  # shape (Nx,)
+
+    # second-derivative (Hessian) approximation
+    # build eps outer for state-only sigma-points
+    eps_outer = usp_[:, :, None] * usp_[:, None, :]       # (N, xdim, xdim)
+    eps_outer = eps_outer - jnp.eye(xdim)[None, :, :]     # subtract identity of size xdim
+
+    L_inv = jax.scipy.linalg.solve_triangular(chol_cov, jnp.eye(chol_cov.shape[0]), lower=True)
+    eps_outer_transformed = jax.vmap(lambda e: L_inv.T @ e @ L_inv)(eps_outer)  # (N, xdim, xdim)
+
+    # central second-difference per sigma point (scalar per n)
+    delta = (V_f_plus + V_f_minus - 2.0 * V_f_0) / 2.0        # (N,)
+
+    # contract: result (xdim, xdim)
+    Vxx_f_s = jnp.einsum('n,n,nij->ij', wsp, delta, eps_outer_transformed)
+    Vxx_f = 0.5 * (Vxx_f_s + Vxx_f_s.T)
+
+    return Vxx_f, Vx_f, V_f
 
 
 @partial(jax.jit, static_argnames=("terminalcost", "wsp_f", "usp_f"))
@@ -1286,6 +2275,12 @@ def QInfo(
 
     # Vxx = Vxx + 1e-3 * jnp.eye(Vxx.shape[0])
     
+    # # Debug prints for diagnostics
+    # jax.debug.print("lx: {}", lx)
+    # jax.debug.print("lu: {}", lu)
+    # jax.debug.print("fx.T @ Vx: {}", fx.T @ Vx)
+    # jax.debug.print("fu.T @ Vx: {}", fu.T @ Vx)
+
     # First-order
     Qx = lx + fx.T @ Vx
     Qu = lu + fu.T @ Vx
@@ -1302,8 +2297,9 @@ def QInfo(
 
     return QDerivatives(Qx=Qx, Qu=Qu, Qxx=Qxx, Qux=Qux, Quu=Quu)
 
-@partial(jax.jit, static_argnames=("runningcost", "dt", "wsp_r", "usp_r"))
-def QInfo_wup(nVxx, nVx, nV, nX, SPs, nX_SPs, chol_cov, runningcost, dt, wsp_r, usp_r):
+
+@partial(jax.jit, static_argnames=("runningcost", "dt", "wsp_r", "usp_r", "use_second_order_info"))
+def QInfo_wup(nVxx, nVx, nV, nX, SPs, nX_SPs, chol_cov, runningcost, dt, wsp_r, usp_r, use_second_order_info):
 
     xdim = nX.shape[0]
     zdim = chol_cov.shape[0]
@@ -1316,11 +2312,22 @@ def QInfo_wup(nVxx, nVx, nV, nX, SPs, nX_SPs, chol_cov, runningcost, dt, wsp_r, 
         # jax.debug.print("u: {}", u)
         # jax.debug.print("nX_SP: {}", nX_SP)
         # jax.debug.print("nX: {}", nX)
+        # jax.debug.print("use_second_order_info: {}", use_second_order_info)
 
         Q_i = dt * runningcost(x, u) + 0.5 * (nX_SP - nX).T @ nVxx @ (nX_SP - nX) + nVx.T @ (nX_SP - nX) + nV
+        Q_i_ = dt * runningcost(x, u) + 0.5 * (nX_SP - nX).T @ nVxx @ (nX_SP - nX) + nV
+        Q_i__ = dt * runningcost(x, u) + nVx.T @ (nX_SP - nX) + nV
 
         Qz_i = Q_i * usp
-        Qzz_i = Q_i * (jnp.outer(usp, usp) - jnp.eye(zdim))
+
+        Qzz_i = lax.cond(
+            use_second_order_info,
+            lambda _: Q_i * (jnp.outer(usp, usp) - jnp.eye(zdim)),
+            lambda _: Q_i_ * (jnp.outer(usp, usp) - jnp.eye(zdim)),
+            operand=None
+        )
+
+        # Qzz_i = Q_i * (jnp.outer(usp, usp) - jnp.eye(zdim))
 
         Q_i = wsp * Q_i
         Qz_i = wsp * Qz_i
@@ -1356,6 +2363,149 @@ def QInfo_wup(nVxx, nVx, nV, nX, SPs, nX_SPs, chol_cov, runningcost, dt, wsp_r, 
     # tmp2 = jnp.linalg.solve(chol_cov.T, Qzz) @ jnp.linalg.inv(chol_cov)
     tmp = jax.scipy.linalg.solve_triangular(chol_cov.T, Qzz, lower=False) # solves L^T X = M
     tmp2 = jax.scipy.linalg.solve_triangular(chol_cov.T, tmp.T, lower=False).T # solves L^T Y = X^T  => Y = L^{-T} X^T
+    tmp2 = 0.5 * (tmp2 + tmp2.T)
+    Qxx = tmp2[:xdim, :xdim]
+    Qxu = tmp2[:xdim, xdim:]
+    # Qux = tmp2[xdim:, :xdim]
+    Quu = tmp2[xdim:, xdim:]
+
+    return Q, Qx, Qu, Qxx, Qxu, Quu
+
+@partial(jax.jit, static_argnames=("runningcost", "dt", "wsp", "usp", "use_second_order_info"))
+def QInfo_wup_atv(nVxx, nVx, nV, cZ, nX, SPs_all, nX_SPs_all, chol_cov, runningcost, dt, wsp, usp, use_second_order_info):
+
+    xdim = nX.shape[0]
+    zdim = cZ.shape[0]
+    usp_ = usp.T  # shape (N_sigma, zdim)
+
+    # split combined sigma-points (2*N_sigma, zdim) into positive and negative halves
+    # Use half the length along the first axis of SPs_all as N_sigma
+    N_sigma = SPs_all.shape[0] // 2
+    pSPs = SPs_all[:N_sigma, :]
+    nSPs = SPs_all[N_sigma:, :]
+
+    # split corresponding next-state sigma-points (2*N_sigma, xdim) as well
+    p_nX_SPs = nX_SPs_all[:N_sigma, :]
+    n_nX_SPs = nX_SPs_all[N_sigma:, :]
+
+    nV = 0.0
+
+    def q_full(sp, nx_sp):
+        x = sp[:xdim]
+        u = sp[xdim:]
+        delta = nx_sp - nX
+        return dt * runningcost(x, u) + 0.5 * (delta.T @ nVxx @ delta) + (nVx.T @ delta) + nV
+
+    def q_partial_vxx(sp, nx_sp):
+        x = sp[:xdim]
+        u = sp[xdim:]
+        delta = nx_sp - nX
+        return dt * runningcost(x, u) + 0.5 * (delta.T @ nVxx @ delta) + nV
+    
+    def q_partial_vx(sp, nx_sp):
+        x = sp[:xdim]
+        u = sp[xdim:]
+        delta = nx_sp - nX
+        return dt * runningcost(x, u) + (nVx.T @ delta) + nV
+    
+    # def running_cost_only(sp, nx_sp):
+    #     x = sp[:xdim]
+    #     u = sp[xdim:]
+    #     delta = nx_sp - nX
+    #     return dt * runningcost(x, u)
+    
+    # def vx_only(sp, nx_sp):
+    #     x = sp[:xdim]
+    #     u = sp[xdim:]
+    #     delta = nx_sp - nX
+    #     return (nVx.T @ delta) + nV
+
+    Q_plus = jax.vmap(q_full)(pSPs, p_nX_SPs)    # (N_sigma,)
+    Q_minus = jax.vmap(q_full)(nSPs, n_nX_SPs)  # (N_sigma,)
+
+    # rc_only_plus = jax.vmap(running_cost_only)(pSPs, p_nX_SPs)    # (N_sigma,)
+    # rc_only_minus = jax.vmap(running_cost_only)(nSPs, n_nX_SPs)  # (N_sigma,)
+
+    # vx_only_plus = jax.vmap(vx_only)(pSPs, p_nX_SPs)    # (N_sigma,)
+    # vx_only_minus = jax.vmap(vx_only)(nSPs, n_nX_SPs)  # (N_sigma,)
+
+    # combined stacked arrays
+    Q_all = jnp.concatenate([Q_plus, Q_minus], axis=0)  # (2*N,)
+    # rc_only_all = jnp.concatenate([rc_only_plus, rc_only_minus], axis=0)  # (2*N,)
+    # vx_only_all = jnp.concatenate([vx_only_plus, vx_only_minus], axis=0)  # (2*N,)
+    
+    # weighted mean over both + and - sets (average of the two weighted means)
+    Q_all_mean = 0.5 * (wsp @ Q_plus + wsp @ Q_minus)   # scalar
+    Q = Q_all_mean
+
+    # Build batches of Z = [x; u] split into x and u for all sigma points (both + and -)
+    x_batch = SPs_all[:, :xdim]        # shape (2*N_sigma, xdim)
+    u_batch = SPs_all[:, xdim:]        # shape (2*N_sigma, udim)
+
+    # Nominal (reference) state and input from combined z
+    x_nominal = cZ[:xdim]
+    u_nominal = cZ[xdim:]
+    Qx, Qu = calc_AB_lstsq_scalar(x_batch, u_batch, Q_all, Q_all_mean, x_nominal, u_nominal)
+
+
+    # # compute gradient (Nx,) using scalar least-squares helper
+    
+    # diff = 0.5 * (Q_plus - Q_minus)  # shape (N_sigma,)
+    # diff_rc_only = 0.5 * (rc_only_plus - rc_only_minus)  # shape (N_sigma,)
+    # diff_vx_only = 0.5 * (vx_only_plus - vx_only_minus)  # shape (N_sigma,)
+
+    # # # weight each row by wsp and sum over sigma points -> (zdim,)
+    # Qz = jnp.sum(wsp[:, None] * (diff[:, None] * usp_), axis=0)
+    # tmp = jax.scipy.linalg.solve_triangular(chol_cov.T, Qz, lower=False)
+    # Qx  = tmp[:xdim]
+    # Qu  = tmp[xdim:]
+
+    # rc_only_z = jnp.sum(wsp[:, None] * (diff_rc_only[:, None] * usp_), axis=0)
+    # tmp = jax.scipy.linalg.solve_triangular(chol_cov.T, rc_only_z, lower=False)
+    # lx  = tmp[:xdim]
+    # lu  = tmp[xdim:]
+
+    # vx_only_z = jnp.sum(wsp[:, None] * (diff_vx_only[:, None] * usp_), axis=0)
+    # tmp = jax.scipy.linalg.solve_triangular(chol_cov.T, vx_only_z, lower=False)
+    # fxvx_x  = tmp[:xdim]
+    # fuvx_u  = tmp[xdim:]
+
+    # # Debug prints for diagnostics
+    # jax.debug.print("lx: {}", lx)
+    # jax.debug.print("lu: {}", lu)
+    # jax.debug.print("fx.T @ Vx: {}", fxvx_x)
+    # jax.debug.print("fu.T @ Vx: {}", fuvx_u)
+
+    # second-derivative (Hessian) approximation
+    # build eps outer for state-only sigma-points
+    
+    eps_outer = usp_[:, :, None] * usp_[:, None, :]       # (N, xdim, xdim)
+    eps_outer = eps_outer - jnp.eye(zdim)[None, :, :]     # subtract identity of size zdim
+
+    L_inv = jax.scipy.linalg.solve_triangular(chol_cov, jnp.eye(chol_cov.shape[0]), lower=True)
+    eps_outer_transformed = jax.vmap(lambda e: L_inv.T @ e @ L_inv)(eps_outer)  # (N, xdim, xdim)
+
+    # Compute Q_plus_, Q_minus_, Q_0_ using either q_full or q_partial depending on use_second_order_info
+    Q_plus_, Q_minus_, Q_0_ = lax.cond(
+        use_second_order_info,
+        lambda _: (
+            jax.vmap(q_full)(pSPs, p_nX_SPs),
+            jax.vmap(q_full)(nSPs, n_nX_SPs),
+            q_full(cZ, nX),
+        ),
+        lambda _: (
+            jax.vmap(q_partial_vxx)(pSPs, p_nX_SPs),
+            jax.vmap(q_partial_vxx)(nSPs, n_nX_SPs),
+            q_partial_vxx(cZ, nX),
+        ),
+        operand=None,
+    )
+    
+    # central second-difference per sigma point (scalar per n)
+    delta = (Q_plus_ + Q_minus_ - 2.0 * Q_0_) / 2.0        # (N,)
+
+    # contract: result (xdim, xdim)
+    tmp2 = jnp.einsum('n,n,nij->ij', wsp, delta, eps_outer_transformed)
     tmp2 = 0.5 * (tmp2 + tmp2.T)
     Qxx = tmp2[:xdim, :xdim]
     Qxu = tmp2[:xdim, xdim:]
@@ -1629,6 +2779,56 @@ def forward_iteration_wup(
     return Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new
 
 @partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def forward_iteration_wup_atv(
+    Xs, Us,
+    Ks, ks,
+    Vprev, dV,
+    cov_policy,
+    SPs, nX_SPs, Covs_Zs, chol_Covs_Zs,
+    toproblem: "TOProblemDefinition",
+    toalgorithm: "TOAlgorithm",
+):
+    """
+    Like forward_iteration_list but for the sigma-point forward_pass_wup.
+    Returns (Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new)
+    # """
+    eps_list = toalgorithm.params.eps_list
+    eps_list = jnp.asarray(eps_list)
+    eps0 = eps_list[0]
+    carry0 = (eps0, Vprev, Xs, Us, False, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs)
+
+    def body(carry, eps):
+        eps_curr, V_curr, Xs_curr, Us_curr, done, SPs_curr, nX_SPs_curr, Covs_curr, chol_Covs_curr = carry
+
+        def try_eps(_):
+            (Xs_try, Us_try, SPs_try, nX_SPs_try, Covs_try, chol_try), V_try = forward_pass_wup_atv(
+                Xs, Us, Ks, ks, cov_policy, toproblem, toalgorithm, eps
+            )
+            accept = V_try < Vprev
+            eps_out = lax.select(accept, eps, eps_curr)
+            V_out = lax.select(accept, V_try, V_curr)
+            Xs_out = lax.select(accept, Xs_try, Xs_curr)
+            Us_out = lax.select(accept, Us_try, Us_curr)
+            SPs_out = lax.select(accept, SPs_try, SPs_curr)
+            nX_SPs_out = lax.select(accept, nX_SPs_try, nX_SPs_curr)
+            Covs_out = lax.select(accept, Covs_try, Covs_curr)
+            chol_out = lax.select(accept, chol_try, chol_Covs_curr)
+            done_out = done | accept
+            return (eps_out, V_out, Xs_out, Us_out, done_out, SPs_out, nX_SPs_out, Covs_out, chol_out), None
+
+        def skip(_):
+            return (eps_curr, V_curr, Xs_curr, Us_curr, done, SPs_curr, nX_SPs_curr, Covs_curr, chol_Covs_curr), None
+
+        carry_out, _ = lax.cond(done, skip, try_eps, operand=None)
+        return carry_out, None
+
+    final_carry, _ = lax.scan(body, carry0, eps_list)
+    (eps_used, V_new, Xs_new, Us_new, done,
+     SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new) = final_carry
+
+    return Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
 def forward_iteration_wup_once(
     Xs, Us,
     Ks, ks,
@@ -1688,6 +2888,72 @@ def calc_AB_lstsq(x_batch, u_batch, x_next_batch, x_next_batch_mean, x_nominal, 
 
     return A, B
 
+def calc_AB_lstsq_scalar(xs: jnp.ndarray,
+                        us: jnp.ndarray,
+                        q_all: jnp.ndarray,
+                        q_mean: float,
+                        x_ref: jnp.ndarray,
+                        u_ref: jnp.ndarray,
+                        reg: float = 1e-12):
+    """
+    Weighted/regularized least-squares estimate of linear map
+        q - q_mean  ≈  A @ (x - x_ref) + B @ (u - u_ref)
+
+    Args:
+        xs: (N, Nx) states at samples
+        us: (N, Nu) inputs at samples
+        q_all: (N,) scalar function values at samples
+        q_mean: scalar mean of q_all (weighted or arithmetic)
+        x_ref: (Nx,) reference state
+        u_ref: (Nu,) reference input
+        reg: Tikhonov regularization added to H^T H for stability
+
+    Returns:
+        A: (Nx,) gradient d q / d x
+        B: (Nu,) gradient d q / d u
+    """
+    # center predictors and responses
+    Xc = xs - x_ref[None, :]    # (N, Nx)
+    Uc = us - u_ref[None, :]    # (N, Nu)
+    H = jnp.concatenate([Xc, Uc], axis=1)  # (N, Nx+Nu)
+
+    F = q_all - q_mean         # (N,)
+
+    # normal equations with regularization: (H^T H + reg I) m = H^T F
+    HtH = H.T @ H                              # (Nx+Nu, Nx+Nu)
+    HtF = H.T @ F                              # (Nx+Nu,)
+
+    # add small ridge for numerical stability
+    HtH_reg = HtH + reg * jnp.eye(HtH.shape[0])
+
+    m = jnp.linalg.solve(HtH_reg, HtF)         # (Nx+Nu,)
+    Nx = Xc.shape[1]
+    A = m[:Nx]                                 # (Nx,)
+    B = m[Nx:]                                 # (Nu,)
+
+    return A, B
+
+def calc_A_lstsq(xs, f_all, f_mean, x_ref):
+    """
+    Least-squares estimate of A mapping (x - x_ref) -> (f - f_mean) for scalar f.
+
+    Args:
+        xs: (N, Nx) array of x samples
+        f_all: (N,) array of scalar f(x) values at those samples
+        f_mean: scalar mean of f_all
+        x_ref: (Nx,) reference state
+
+    Returns:
+        fx_s: (Nx,) estimated gradient d f / d x (linear map)
+    """
+    H = xs - x_ref[None, :]        # (N, Nx)
+    F = f_all - f_mean            # (N,)
+
+    # solve for M in H @ M = F  =>  M = pinv(H) @ F  (M has shape (Nx,))
+    M = jnp.linalg.pinv(H) @ F    # (Nx,)
+    fx_s = M                      # gradient as 1D array
+    return fx_s
+
 
 # region: Sigma Points and Weights
 
@@ -1716,7 +2982,7 @@ def g_ws(n, params=None):
       n: dimension (int)
       params: dict-like with optional keys:
         - "order" (int): number of samples (mcsamples). default 100
-        - "key" (int or jax.random.PRNGKey): RNG seed/key. default PRNGKey(0)
+        - "key" (int or jax.random.PRNGKey): RNG seed/key. default: use time-based seed so samples differ per call
 
     Returns:
       W: jnp.ndarray shape (m,), all entries 1/m
@@ -1728,15 +2994,60 @@ def g_ws(n, params=None):
 
     key = params.get("key", None)
     if key is None:
+        # Use a time-derived seed so repeated calls produce different samples
+        seed = int(time.time_ns() % (2**32))
+        key = jax.random.PRNGKey(seed)
+    elif isinstance(key, int):
+        key = jax.random.PRNGKey(int(key))
+    # if key already a PRNGKey (jax array), use as-is
+
+    # split so we don't consume the caller's key state
+    key, subkey = jax.random.split(key)
+    XI = jax.random.normal(subkey, (n, m))
+    W = jnp.full((m,), 1.0 / m, dtype=XI.dtype)
+    return W, XI
+
+def g_ws_new(n, params=None):
+    """
+    Monte-Carlo samples with moment matching (mean=0, cov=I).
+
+    Args:
+      n: dimension (int)
+      params: dict-like with optional keys:
+        - "order" (int): number of samples (mcsamples). default 100
+        - "key" (int or jax.random.PRNGKey): RNG seed/key. default PRNGKey(0)
+
+    Returns:
+      W: jnp.ndarray shape (m,), all entries 1/m
+      XI: jnp.ndarray shape (n, m), samples with exact mean=0 and cov=I
+    """
+    params = params or {}
+    m = int(params.get("order", params.get("mcsamples", 100)))
+
+    key = params.get("key", None)
+    if key is None:
         key = jax.random.PRNGKey(42)
     elif isinstance(key, int):
         key = jax.random.PRNGKey(key)
     # if key already a PRNGKey, use it as-is
 
     key, subkey = jax.random.split(key)
-    XI = jax.random.normal(subkey, (n, m))
+    XI = jax.random.normal(subkey, (n, m))  # raw N(0, I) samples
+
+    # moment match: enforce mean=0, cov=I
+    mu = XI.mean(axis=1, keepdims=True)  # (n,1)
+    Xc = XI - mu
+    C = (Xc @ Xc.T) / (m - 1)            # empirical cov (n,n)
+
+    # Cholesky-based whitening
+    C, Ls = safe_cholesky_eig(C, abs_tol=1e-12)
+    # Map: Xc -> Xc @ Ls^{-1}
+    Xw = jax.scipy.linalg.solve_triangular(Ls, Xc, lower=True)
+
+    XI = Xw
     W = jnp.full((m,), 1.0 / m, dtype=XI.dtype)
     return W, XI
+
 
 
 # ---- Gaussian-Hermite Quadrature Weights and Sigma Points ----
@@ -2196,6 +3507,8 @@ def plot_block_results(result, x0, xg, modelparams):
 
     plt.tight_layout()
     plt.show()
+    fig.savefig(f"block_results_{time.strftime('%Y%m%d_%H%M%S')}.png", bbox_inches='tight', dpi=150)
+
 
 
 def plot_pendulum_results(result, x0, xg, modelparams):
@@ -2307,6 +3620,8 @@ def plot_pendulum_results(result, x0, xg, modelparams):
 
     plt.tight_layout()
     plt.show()
+    fig.savefig(f"pendulum_results_{time.strftime('%Y%m%d_%H%M%S')}.png", bbox_inches='tight', dpi=150)
+
 
 def plot_cartpole_results(result, x0, xg, modelparams):
     """
@@ -2438,295 +3753,982 @@ def plot_cartpole_results(result, x0, xg, modelparams):
 
     plt.tight_layout()
     plt.show()
+    fig.savefig(f"cartpole_results_{time.strftime('%Y%m%d_%H%M%S')}.png", bbox_inches='tight', dpi=150)
 
 
-def plot_compare_block_results(algorithms, x0, xg, modelparams):
-    import matplotlib.pyplot as plt
+# def plot_compare_cartpole_results(algorithms, x0, xg, modelparams):
+#     """
+#     Compare multiple cartpole algorithms with a 2x2 figure:
+#       (0,0) Position vs Velocity (phase)
+#       (0,1) Pendulum Angle vs Angular Velocity (phase)
+#       (1,0) Input vs Time
+#       (1,1) Vstore vs Iterations (log scale)
+#     algorithms: list of tuples (name, xbar, ubar, Vstore)
+#       - xbar: array-like shape (T+1, 4)  (pos, vel, angpos, angvel)
+#       - ubar: array-like shape (T, ) or (T, nu)
+#       - Vstore: array-like of iteration costs
+#     x0, xg: initial and goal states (length 4)
+#     modelparams: object with .dt attribute
+#     """
+#     import matplotlib.pyplot as plt
+#     import numpy as np
+#     import matplotlib as mpl
+#     import seaborn as sns
+
+#     sns.set_theme(style="darkgrid")
+#     sns.set_context('notebook', font_scale=1.0)
+
+#     n_alg = max(1, len(algorithms))
+#     palette = sns.color_palette("flare", n_colors=n_alg)
+#     colors = [palette[i % len(palette)] for i in range(len(algorithms))]
+#     linestyles = list(reversed(['-', '--', '-.', ':']))
+
+#     mpl.rcParams.update({
+#         'figure.figsize': (14, 10),
+#         'axes.titlesize': 14,
+#         'axes.labelsize': 12,
+#         'legend.fontsize': 10,
+#         'xtick.labelsize': 10,
+#         'ytick.labelsize': 10,
+#         'lines.linewidth': 2.2,
+#     })
+
+#     dt = modelparams.dt
+
+#     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+#     # (0,0) Cart: position vs velocity
+#     ax00 = axs[0, 0]
+#     for i, (name, xbar, _, _) in enumerate(algorithms):
+#         xb = np.asarray(xbar)
+#         if xb.ndim == 1 or xb.shape[0] < 2:
+#             continue
+#         ax00.plot(xb[:, 0], xb[:, 1],
+#                   color=colors[i],
+#                   linestyle=linestyles[i % len(linestyles)],
+#                   label=name)
+#     x0_np = np.asarray(x0)
+#     xg_np = np.asarray(xg)
+#     ax00.scatter(x0_np[0], x0_np[1], color='red', s=60, marker='o', label='Start')
+#     ax00.scatter(xg_np[0], xg_np[1], color='green', s=80, marker='*', label='Goal')
+#     ax00.set_xlabel('Cart Position')
+#     ax00.set_ylabel('Cart Velocity')
+#     ax00.set_title('Cart: Position vs Velocity')
+#     ax00.legend(frameon=True)
+#     ax00.grid(alpha=0.45)
+
+#     # (0,1) Pendulum: angle vs angular velocity
+#     ax01 = axs[0, 1]
+#     for i, (name, xbar, _, _) in enumerate(algorithms):
+#         xb = np.asarray(xbar)
+#         if xb.ndim == 1 or xb.shape[0] < 2:
+#             continue
+#         ax01.plot(xb[:, 2], xb[:, 3],
+#                   color=colors[i],
+#                   linestyle=linestyles[i % len(linestyles)],
+#                   label=name)
+#     ax01.scatter(x0_np[2], x0_np[3], color='red', s=60, marker='o', label='Start')
+#     ax01.scatter(xg_np[2], xg_np[3], color='green', s=80, marker='*', label='Goal')
+#     ax01.set_xlabel('Pendulum Angle')
+#     ax01.set_ylabel('Angular Velocity')
+#     ax01.set_title('Pendulum: Angle vs Angular Velocity')
+#     ax01.legend(frameon=True)
+#     ax01.grid(alpha=0.45)
+
+#     # (1,0) Input vs time
+#     ax10 = axs[1, 0]
+#     for i, (name, _, ubar, _) in enumerate(algorithms):
+#         ub = np.asarray(ubar)
+#         uvals = ub if ub.ndim == 1 else ub[:, 0]
+#         t = np.arange(uvals.shape[0]) * dt
+#         ax10.plot(t, uvals, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+#     ax10.set_xlabel('Time (s)')
+#     ax10.set_ylabel('Input')
+#     ax10.set_title('Input vs Time')
+#     ax10.legend(frameon=True)
+#     ax10.grid(alpha=0.45)
+
+#     # (1,1) Vstore vs iterations (log)
+#     ax11 = axs[1, 1]
+#     V_list = [np.asarray(Vstore) for (_, _, _, Vstore) in algorithms]
+#     if len(V_list) > 0:
+#         global_min = min([V.min() for V in V_list])
+#         offset = 0.0
+#         if global_min <= 0:
+#             offset = 1e-12 - global_min
+#         for i, (name, _, _, Vstore) in enumerate(algorithms):
+#             V = np.asarray(Vstore) + offset
+#             it = np.arange(len(V))
+#             ax11.plot(it, V, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
+#     ax11.set_yscale('log')
+#     ax11.set_xlabel('Iteration')
+#     ax11.set_ylabel('Vstore')
+#     ax11.set_title('Cost vs Iteration (log)')
+#     ax11.legend(frameon=True)
+#     ax11.grid(which='both', alpha=0.35)
+
+#     plt.tight_layout()
+#     plt.show()
+
+#     fig.savefig(f"compare_cartpole_results_{time.strftime('%Y%m%d_%H%M%S')}.png", bbox_inches='tight', dpi=150)
+
+
+# def plot_compare_cartpole_results_2(algorithms, x0, xg, modelparams, outpath=None, figsize=(14, 10), dpi=150):
+#     """
+#     Professional 2x2 comparison plot for cartpole results.
+
+#     Panels:
+#       (0,0) Cart Position vs Cart Velocity (phase)
+#       (0,1) Pendulum Angle vs Angular Velocity (phase)
+#       (1,0) Input vs Time
+#       (1,1) Cost (Vstore) vs Iteration (log)
+
+#     algorithms: list of tuples (name, xbar, ubar, Vstore)
+#       - xbar: (T+1, 4) columns [pos, vel, angle, angvel]
+#       - ubar: (T,) or (T, nu)
+#       - Vstore: iterable or None
+#     x0, xg: length-4 start and goal states
+#     modelparams: object or dict with attribute/key 'dt'
+#     outpath: optional file path or directory to save png
+#     Returns: fig, axs
+#     """
+#     import time
+#     import warnings
+#     import os
+#     import numpy as np
+#     import matplotlib as mpl
+#     import matplotlib.pyplot as plt
+#     import seaborn as sns
+#     from cycler import cycler
+
+#     # Seaborn theme + palette
+#     # sns.set_theme(style="darkgrid")
+#     sns.set_context("notebook", font_scale=1.0)
+#     n_alg = max(1, len(algorithms))
+#     palette = sns.color_palette("flare", n_colors=max(4, n_alg))
+#     linestyles = [":", "-.", "--", "-"]
+
+#     # Enforce LaTeX-like sans-serif and DejaVu Sans mathtext
+#     mpl.rcParams.update({
+#         "mathtext.fontset": "stixsans",
+#         "font.family": "sans-serif",
+#         "font.sans-serif": ["DejaVu Sans"],
+#         "text.usetex": False,
+#         "mathtext.default": "regular",
+#         "pdf.fonttype": 42,
+#         "ps.fonttype": 42,
+#         "figure.figsize": figsize,
+#         "lines.linewidth": 2.0,
+#         "axes.labelsize": 14,
+#         "axes.titlesize": 15,
+#         "legend.fontsize": 11,
+#         "xtick.labelsize": 11,
+#         "ytick.labelsize": 11,
+#     })
+
+#     # set cycler so colors/linestyles alternate nicely
+#     styles = cycler("color", palette) + cycler("linestyle", [linestyles[i % len(linestyles)] for i in range(len(palette))])
+#     mpl.rcParams["axes.prop_cycle"] = styles
+
+#     # figure and axes
+#     fig, axs = plt.subplots(2, 2, figsize=figsize)
+#     ax00, ax01, ax10, ax11 = axs[0, 0], axs[0, 1], axs[1, 0], axs[1, 1]
+
+#     # dt extraction with fallback
+#     dt = getattr(modelparams, "dt", None)
+#     if dt is None:
+#         try:
+#             dt = float(modelparams["dt"])
+#         except Exception:
+#             dt = 1.0
+
+#     # Convert start/goal to numpy
+#     x0_np = np.asarray(x0)
+#     xg_np = np.asarray(xg)
+
+#     # (0,0) Cart: position vs velocity
+#     for i, (name, xbar, _, _) in enumerate(algorithms):
+#         xb = np.asarray(xbar)
+#         if xb.ndim == 1:
+#             if xb.size >= 2:
+#                 ax00.plot([xb[0]], [xb[1]], marker="o", linestyle="None", label=name)
+#             continue
+#         if xb.shape[1] >= 2:
+#             ax00.plot(xb[:, 0], xb[:, 1], label=name)
+#     ax00.scatter(x0_np[0], x0_np[1], color="#1755b1", s=64, marker="o", label=r'$\mathsf{Start}$')
+#     ax00.scatter(xg_np[0], xg_np[1], color="#48e750", s=96, marker="*", label=r'$\mathsf{Goal}$')
+#     ax00.set_xlabel(r'$\mathsf{Cart\ Position (m)}$')
+#     ax00.set_ylabel(r'$\mathsf{Cart\ Velocity (m/s)}$')
+#     ax00.set_title(r'$\mathsf{Cart:\ Position\ vs\ Velocity}$')
+#     ax00.grid(alpha=0.35)
+
+#     # (0,1) Pendulum: angle vs angular velocity
+#     for i, (name, xbar, _, _) in enumerate(algorithms):
+#         xb = np.asarray(xbar)
+#         if xb.ndim == 1:
+#             if xb.size >= 4:
+#                 ax01.plot([xb[2]], [xb[3]], marker="o", linestyle="None", label=name)
+#             continue
+#         if xb.shape[1] >= 4:
+#             ax01.plot(xb[:, 2], xb[:, 3], label=name)
+#     ax01.scatter(x0_np[2], x0_np[3], color="#1755b1", s=64, marker="o", label=r'$\mathsf{Start}$')
+#     ax01.scatter(xg_np[2], xg_np[3], color="#48e750", s=96, marker="*", label=r'$\mathsf{Goal}$')
+#     ax01.set_xlabel(r'$\mathsf{Pendulum\ Angle (rad)}$')
+#     ax01.set_ylabel(r'$\mathsf{Angular\ Velocity (rad/s)}$')
+#     ax01.set_title(r'$\mathsf{Pendulum:\ Angle\ vs\ Angular\ Velocity}$')
+#     ax01.grid(alpha=0.35)
+
+#     # (1,0) Input vs time
+#     for i, (name, _, ubar, _) in enumerate(algorithms):
+#         ub = np.asarray(ubar)
+#         if ub.ndim == 1:
+#             uvals = ub
+#         else:
+#             uvals = ub[:, 0] if ub.shape[1] >= 1 else ub.flatten()
+#         t = np.arange(uvals.shape[0]) * dt
+#         ax10.plot(t, uvals, label=name)
+#     ax10.set_xlabel(r'$\mathsf{Time\ (s)}$')
+#     ax10.set_ylabel(r'$\mathsf{Input\ (N)}$')
+#     ax10.set_title(r'$\mathsf{Input\ vs\ Time}$')
+#     ax10.grid(alpha=0.35)
+
+#     # (1,1) Vstore vs iterations (log)
+#     V_list = [np.asarray(Vstore) for (_, _, _, Vstore) in algorithms if Vstore is not None]
+#     if len(V_list) > 0:
+#         global_min = np.min([np.nanmin(V) for V in V_list])
+#         offset = 0.0
+#         if global_min <= 0:
+#             offset = 1e-12 - float(global_min)
+#         for i, (name, _, _, Vstore) in enumerate(algorithms):
+#             if Vstore is None:
+#                 continue
+#             V = np.asarray(Vstore) + offset
+#             it = np.arange(len(V))
+#             ax11.plot(it, V, label=name)
+#     else:
+#         warnings.warn("No Vstore data provided; cost subplot will be empty.")
+#     ax11.set_yscale("log")
+#     ax11.set_xlabel(r'$\mathsf{Iteration}$')
+#     ax11.set_ylabel(r'$\mathsf{Cost\ (V)}$')
+#     ax11.set_title(r'$\mathsf{Cost\ vs\ Iteration}$')
+#     ax11.grid(which="both", alpha=0.25)
+
+#     # Legends (one per subplot) with DejaVu Sans family
+#     for ax in [ax00, ax01, ax10, ax11]:
+#         leg = ax.legend(frameon=True, fancybox=False, edgecolor="0.2", framealpha=0.9, handlelength=1.2)
+#         if leg is not None:
+#             for text in leg.get_texts():
+#                 text.set_fontfamily("DejaVu Sans")
+
+#     plt.tight_layout()
+
+#     # Save if requested (PDF)
+#     timestamp = time.strftime("%Y%m%d_%H%M%S")
+#     if outpath is None:
+#         outname = f"compare_cartpole_results_{timestamp}.pdf"
+#     else:
+#         # if outpath is directory, save inside it; else treat as filename or prefix
+#         if os.path.isdir(outpath):
+#             outname = os.path.join(outpath, f"compare_cartpole_results_{timestamp}.pdf")
+#         else:
+#             outname = outpath if str(outpath).lower().endswith(".pdf") else f"{outpath.rstrip('/')}_compare_cartpole_results_{timestamp}.pdf"
+#     try:
+#         fig.savefig(outname, dpi=dpi, bbox_inches="tight", facecolor="white", format="pdf")
+#     except Exception:
+#         warnings.warn(f"Failed to save figure to {outname}")
+
+#     plt.show()
+#     return fig,
+
+
+def plot_compare_block_results(algorithms, x0, xg, modelparams, outpath=None, figsize=(14, 5), dpi=300, friction_thresh=None):
+    """
+    Compact 3-panel comparison for block problem with a single inline (one-row) legend
+    placed above the panels.
+
+    New optional argument:
+      - friction_thresh: float or None (default None). If provided, a horizontal dashed red
+        line is drawn on the Input vs Time subplot and an entry for it is added to the legend.
+
+    This variant:
+      - reserves space for the legend so it doesn't overlap titles
+      - reduces inter-panel whitespace
+      - ensures top/bottom text is not clipped when showing or saving
+    Returns (fig, axs).
+    """
+    import time, os, warnings
     import numpy as np
     import matplotlib as mpl
+    import matplotlib.pyplot as plt
     import seaborn as sns
+    from matplotlib.lines import Line2D
+    from cycler import cycler
+    from matplotlib.ticker import MaxNLocator
+    from matplotlib.ticker import LogLocator
 
-    # Use seaborn theme and palette
-    sns.set_theme(style="darkgrid")
-    sns.set_context('notebook', font_scale=1.1)
-
-    # modern seaborn color palette (deep) sized to number of algorithms
+    # Appearance
+    sns.set_context("notebook", font_scale=1.0)
     n_alg = max(1, len(algorithms))
-    # palette = sns.color_palette('magma', n_colors=n_alg)
-    palette = sns.color_palette("flare", n_colors=n_alg)
-    colors = [palette[i % len(palette)] for i in range(len(algorithms))]
-    # colors = [mpl.cm.magma(v) for v in np.linspace(0, 1, n_alg)]
-    linestyles = ['-', '--', '-.', ':']
-    # reverse linestyles so the last algorithm (SPPDP) gets solid '-' by default
-    linestyles = list(reversed(linestyles))
+    palette = sns.color_palette("flare", n_colors=max(4, n_alg))
+    # linestyles = [(0, (1, 1)), (0, (3, 1, 1, 1)), '-.', '-']
+    linestyles = [(0,(0.5,0.5)), (0,(2,1)), (0,(4,1,2,1)), '-']
 
     mpl.rcParams.update({
-        'figure.figsize': (14, 5),
-        'axes.titlesize': 14,
-        'axes.labelsize': 12,
-        'legend.fontsize': 10,
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
-        'lines.linewidth': 2.2,
+        "mathtext.fontset": "stixsans",
+        "font.family": "sans-serif",
+        "font.sans-serif": ["DejaVu Sans"],
+        "text.usetex": False,
+        "mathtext.default": "regular",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "figure.figsize": figsize,
+        "lines.linewidth": 2.0,
+        "axes.labelsize": 30,
+        "axes.titlesize": 30,
+        "legend.fontsize": 20,
+        "xtick.labelsize": 20,
+        "ytick.labelsize": 20,
     })
+    mpl.rcParams["axes.prop_cycle"] = cycler("color", palette) + cycler(
+        "linestyle", [linestyles[i % len(linestyles)] for i in range(len(palette))]
+    )
 
-    dt = modelparams.dt
+    # Create figure and axes. constrained_layout left off so we can reserve space explicitly.
+    fig, axs = plt.subplots(1, 3, figsize=figsize, constrained_layout=False)
+    ax_phase, ax_input, ax_cost = axs
 
-    fig, axs = plt.subplots(1, 3, figsize=(14, 5))
+    # safe dt
+    dt = getattr(modelparams, "dt", None)
+    if dt is None:
+        try:
+            dt = float(modelparams["dt"])
+        except Exception:
+            dt = 1.0
+
+    # Build algorithm legend proxies
+    alg_handles, alg_labels = [], []
+    for i, (name, _, _, _) in enumerate(algorithms):
+        color = palette[i % len(palette)]
+        ls = linestyles[i % len(linestyles)]
+        alg_handles.append(Line2D([0], [0], color=color, lw=4, linestyle=ls))
+        alg_labels.append(name)
 
     # Phase plot (position vs velocity)
-    ax = axs[0]
-    for i, (name, xbar, _, _) in enumerate(algorithms):
+    for i, (_, xbar, _, _) in enumerate(algorithms):
         xb = np.asarray(xbar)
-        if xb.ndim == 1 or xb.shape[0] < 2:
+        color = palette[i % len(palette)]
+        ls = linestyles[i % len(linestyles)]
+        if xb.ndim == 1:
+            if xb.size >= 2:
+                ax_phase.plot([xb[0]], [xb[1]], marker="o", color=color, linestyle="None")
             continue
-        ax.plot(xb[:, 0], xb[:, 1], color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
-    x0_np = np.asarray(x0)
-    xg_np = np.asarray(xg)
-    ax.scatter(x0_np[0], x0_np[1], color='red', s=60, marker='o', label='Start')
-    ax.scatter(xg_np[0], xg_np[1], color='green', s=80, marker='*', label='Goal')
-    ax.set_xlabel('Position')
-    ax.set_ylabel('Velocity')
-    ax.set_title('Phase Plot')
-    ax.legend(frameon=True)
-    ax.grid(alpha=0.45)
+        if xb.shape[1] >= 2:
+            ax_phase.plot(xb[:, 0], xb[:, 1], color=color, linestyle=ls, lw=4)
+    x0_np = np.asarray(x0); xg_np = np.asarray(xg)
+    ax_phase.scatter(x0_np[0], x0_np[1], color="#1755b1", s=200, marker="o", zorder=5)
+    ax_phase.scatter(xg_np[0], xg_np[1], color="#48e750", s=200, marker="*", zorder=5)
+    ax_phase.set_xlabel(r'$\mathsf{Position\ (m)}$'); ax_phase.set_ylabel(r'$\mathsf{Velocity\ (m/s)}$')
+    ax_phase.set_title(r'$\mathsf{Phase\ Plot}$'); ax_phase.grid(alpha=0.35)
 
     # Input vs time
-    ax2 = axs[1]
-    for i, (name, _, ubar, _) in enumerate(algorithms):
+    for i, (_, _, ubar, _) in enumerate(algorithms):
         ub = np.asarray(ubar)
-        uvals = ub if ub.ndim == 1 else ub[:, 0]
+        if ub.ndim == 1:
+            uvals = ub
+        else:
+            uvals = ub[:, 0] if ub.shape[1] >= 1 else ub.flatten()
         t = np.arange(uvals.shape[0]) * dt
-        ax2.plot(t, uvals, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Input')
-    ax2.set_title('Input vs Time')
-    ax2.legend(frameon=True)
-    ax2.grid(alpha=0.45)
+        ax_input.plot(t, uvals, lw=4)
+    # draw friction threshold if provided
+    if friction_thresh is not None:
+        ax_input.axhline(friction_thresh, color="#686565", linestyle="--", linewidth=3, alpha=0.5, zorder=3)
+    ax_input.set_xlabel(r'$\mathsf{Time\ (s)}$'); ax_input.set_ylabel(r'$\mathsf{Input\ (N)}$')
+    ax_input.set_title(r'$\mathsf{Input\ vs\ Time}$'); ax_input.grid(alpha=0.35)
 
-    # Vstore (log scale)
-    ax3 = axs[2]
-    V_list = [np.asarray(Vstore) for (_, _, _, Vstore) in algorithms]
+    # Cost vs iteration (log)
+    # limit x-axis to at most 3 nicely spaced integer ticks (first, middle, last)
+    # Configure markers for cost subplot: circular markers with faint (semi-transparent) face colors
+
+    n_series = max(1, len(algorithms))
+    # palette contains RGB tuples; build RGBA for faint face colors
+    mfc = [(*c, 0.22) for c in palette]          # marker facecolor (faint)
+    mec = [c for c in palette]                   # marker edgecolor (opaque)
+    markers = ['o'] * n_series
+    ms = [6] * n_series                          # marker size
+    mew = [1.2] * n_series                       # marker edge width
+
+    # Compose a prop_cycle that includes color, linestyle and marker styling
+    prop = (
+        cycler("color", palette[:n_series])
+        + cycler("linestyle", [linestyles[i % len(linestyles)] for i in range(n_series)])
+        + cycler("marker", markers)
+        + cycler("markerfacecolor", mfc)
+        + cycler("markeredgecolor", mec)
+        + cycler("markersize", ms)
+        + cycler("markeredgewidth", mew)
+    )
+    ax_cost.set_prop_cycle(prop)
+
+    # Use a simple LogLocator for x ticks (at most 3 nice ticks) if desired
+    ax_cost.xaxis.set_major_locator(LogLocator(numticks=3))
+    V_list = [np.asarray(V) for (_, _, _, V) in algorithms if V is not None]
     if len(V_list) == 0:
-        return
-    global_min = min([V.min() for V in V_list])
-    offset = 0.0
-    if global_min <= 0:
-        offset = 1e-12 - global_min
-    for i, (name, _, _, Vstore) in enumerate(algorithms):
-        V = np.asarray(Vstore) + offset
-        it = np.arange(len(V))
-        ax3.plot(it, V, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
-    ax3.set_yscale('log')
-    ax3.set_xlabel('Iteration')
-    ax3.set_ylabel('Vstore')
-    ax3.set_title('Cost vs Iteration (log)')
-    ax3.legend(frameon=True)
-    ax3.grid(which='both', alpha=0.35)
-
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_compare_pendulum_results(algorithms, x0, xg, modelparams):
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import matplotlib as mpl
-    import seaborn as sns
-
-    # Use seaborn theme and palette
-    sns.set_theme(style="darkgrid")
-    sns.set_context('notebook', font_scale=1.1)
-
-    # modern seaborn color palette (deep) sized to number of algorithms
-    n_alg = max(1, len(algorithms))
-    # palette = sns.color_palette('magma', n_colors=n_alg)
-    palette = sns.color_palette("flare", n_colors=n_alg)
-    colors = [palette[i % len(palette)] for i in range(len(algorithms))]
-    # colors = [mpl.cm.magma(v) for v in np.linspace(0, 1, n_alg)]
-    linestyles = ['-', '--', '-.', ':']
-    # reverse linestyles so the last algorithm (SPPDP) gets solid '-' by default
-    linestyles = list(reversed(linestyles))
-
-    mpl.rcParams.update({
-        'figure.figsize': (14, 5),
-        'axes.titlesize': 14,
-        'axes.labelsize': 12,
-        'legend.fontsize': 10,
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
-        'lines.linewidth': 2.2,
-    })
-
-    dt = modelparams.dt
-
-    fig, axs = plt.subplots(1, 3, figsize=(14, 5))
-
-    # Phase plot (position vs velocity)
-    ax = axs[0]
-    for i, (name, xbar, _, _) in enumerate(algorithms):
-        xb = np.asarray(xbar)
-        if xb.ndim == 1 or xb.shape[0] < 2:
-            continue
-        ax.plot(xb[:, 0], xb[:, 1], color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
-    x0_np = np.asarray(x0)
-    xg_np = np.asarray(xg)
-    ax.scatter(x0_np[0], x0_np[1], color='red', s=60, marker='o', label='Start')
-    ax.scatter(xg_np[0], xg_np[1], color='green', s=80, marker='*', label='Goal')
-    ax.set_xlabel('Angular Position')
-    ax.set_ylabel('Angular Velocity')
-    ax.set_title('Phase Plot')
-    ax.legend(frameon=True)
-    ax.grid(alpha=0.45)
-
-    # Input vs time
-    ax2 = axs[1]
-    for i, (name, _, ubar, _) in enumerate(algorithms):
-        ub = np.asarray(ubar)
-        uvals = ub if ub.ndim == 1 else ub[:, 0]
-        t = np.arange(uvals.shape[0]) * dt
-        ax2.plot(t, uvals, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Input')
-    ax2.set_title('Input vs Time')
-    ax2.legend(frameon=True)
-    ax2.grid(alpha=0.45)
-
-    # Vstore (log scale)
-    ax3 = axs[2]
-    V_list = [np.asarray(Vstore) for (_, _, _, Vstore) in algorithms]
-    if len(V_list) == 0:
-        return
-    global_min = min([V.min() for V in V_list])
-    offset = 0.0
-    if global_min <= 0:
-        offset = 1e-12 - global_min
-    for i, (name, _, _, Vstore) in enumerate(algorithms):
-        V = np.asarray(Vstore) + offset
-        it = np.arange(len(V))
-        ax3.plot(it, V, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
-    ax3.set_yscale('log')
-    ax3.set_xlabel('Iteration')
-    ax3.set_ylabel('Vstore')
-    ax3.set_title('Cost vs Iteration (log)')
-    ax3.legend(frameon=True)
-    ax3.grid(which='both', alpha=0.35)
-
-    plt.tight_layout()
-    plt.show()
-
-def plot_compare_cartpole_results(algorithms, x0, xg, modelparams):
-    """
-    Compare multiple cartpole algorithms with a 2x2 figure:
-      (0,0) Position vs Velocity (phase)
-      (0,1) Pendulum Angle vs Angular Velocity (phase)
-      (1,0) Input vs Time
-      (1,1) Vstore vs Iterations (log scale)
-    algorithms: list of tuples (name, xbar, ubar, Vstore)
-      - xbar: array-like shape (T+1, 4)  (pos, vel, angpos, angvel)
-      - ubar: array-like shape (T, ) or (T, nu)
-      - Vstore: array-like of iteration costs
-    x0, xg: initial and goal states (length 4)
-    modelparams: object with .dt attribute
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import matplotlib as mpl
-    import seaborn as sns
-
-    sns.set_theme(style="darkgrid")
-    sns.set_context('notebook', font_scale=1.0)
-
-    n_alg = max(1, len(algorithms))
-    palette = sns.color_palette("flare", n_colors=n_alg)
-    colors = [palette[i % len(palette)] for i in range(len(algorithms))]
-    linestyles = list(reversed(['-', '--', '-.', ':']))
-
-    mpl.rcParams.update({
-        'figure.figsize': (14, 10),
-        'axes.titlesize': 14,
-        'axes.labelsize': 12,
-        'legend.fontsize': 10,
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
-        'lines.linewidth': 2.2,
-    })
-
-    dt = modelparams.dt
-
-    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-
-    # (0,0) Cart: position vs velocity
-    ax00 = axs[0, 0]
-    for i, (name, xbar, _, _) in enumerate(algorithms):
-        xb = np.asarray(xbar)
-        if xb.ndim == 1 or xb.shape[0] < 2:
-            continue
-        ax00.plot(xb[:, 0], xb[:, 1],
-                  color=colors[i],
-                  linestyle=linestyles[i % len(linestyles)],
-                  label=name)
-    x0_np = np.asarray(x0)
-    xg_np = np.asarray(xg)
-    ax00.scatter(x0_np[0], x0_np[1], color='red', s=60, marker='o', label='Start')
-    ax00.scatter(xg_np[0], xg_np[1], color='green', s=80, marker='*', label='Goal')
-    ax00.set_xlabel('Cart Position')
-    ax00.set_ylabel('Cart Velocity')
-    ax00.set_title('Cart: Position vs Velocity')
-    ax00.legend(frameon=True)
-    ax00.grid(alpha=0.45)
-
-    # (0,1) Pendulum: angle vs angular velocity
-    ax01 = axs[0, 1]
-    for i, (name, xbar, _, _) in enumerate(algorithms):
-        xb = np.asarray(xbar)
-        if xb.ndim == 1 or xb.shape[0] < 2:
-            continue
-        ax01.plot(xb[:, 2], xb[:, 3],
-                  color=colors[i],
-                  linestyle=linestyles[i % len(linestyles)],
-                  label=name)
-    ax01.scatter(x0_np[2], x0_np[3], color='red', s=60, marker='o', label='Start')
-    ax01.scatter(xg_np[2], xg_np[3], color='green', s=80, marker='*', label='Goal')
-    ax01.set_xlabel('Pendulum Angle')
-    ax01.set_ylabel('Angular Velocity')
-    ax01.set_title('Pendulum: Angle vs Angular Velocity')
-    ax01.legend(frameon=True)
-    ax01.grid(alpha=0.45)
-
-    # (1,0) Input vs time
-    ax10 = axs[1, 0]
-    for i, (name, _, ubar, _) in enumerate(algorithms):
-        ub = np.asarray(ubar)
-        uvals = ub if ub.ndim == 1 else ub[:, 0]
-        t = np.arange(uvals.shape[0]) * dt
-        ax10.plot(t, uvals, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
-    ax10.set_xlabel('Time (s)')
-    ax10.set_ylabel('Input')
-    ax10.set_title('Input vs Time')
-    ax10.legend(frameon=True)
-    ax10.grid(alpha=0.45)
-
-    # (1,1) Vstore vs iterations (log)
-    ax11 = axs[1, 1]
-    V_list = [np.asarray(Vstore) for (_, _, _, Vstore) in algorithms]
-    if len(V_list) > 0:
-        global_min = min([V.min() for V in V_list])
+        warnings.warn("No Vstore data provided; cost subplot will be empty.")
+    else:
+        global_min = np.min([np.nanmin(V) for V in V_list])
         offset = 0.0
         if global_min <= 0:
-            offset = 1e-12 - global_min
-        for i, (name, _, _, Vstore) in enumerate(algorithms):
-            V = np.asarray(Vstore) + offset
-            it = np.arange(len(V))
-            ax11.plot(it, V, color=colors[i], linestyle=linestyles[i % len(linestyles)], label=name)
-    ax11.set_yscale('log')
-    ax11.set_xlabel('Iteration')
-    ax11.set_ylabel('Vstore')
-    ax11.set_title('Cost vs Iteration (log)')
-    ax11.legend(frameon=True)
-    ax11.grid(which='both', alpha=0.35)
+            offset = 1e-12 - float(global_min)
+        for i, (_, _, _, V) in enumerate(algorithms):
+            if V is None:
+                continue
+            Varr = np.asarray(V) + offset
+            # start iterations from 1 instead of 0
+            it = np.arange(1, len(Varr) + 1)
+            ax_cost.plot(it, Varr, lw=4)
+        ax_cost.set_yscale("log")
+        ax_cost.set_xscale("log")
+    ax_cost.set_xlabel(r'$\mathsf{Iteration}$'); ax_cost.set_ylabel(r'$\mathsf{Cost\ (V)}$')
+    ax_cost.set_title(r'$\mathsf{Cost\ vs\ Iteration}$'); ax_cost.grid(which="both", alpha=0.25)
 
-    plt.tight_layout()
+    # Add Start/Goal proxies and optional friction proxy, then create top inline legend.
+    start_handle = Line2D([0], [0], color="#1755b1", marker="o", linestyle="None", markersize=15)
+    goal_handle = Line2D([0], [0], color="#48e750", marker="*", linestyle="None", markersize=15)
+
+    handles = list(alg_handles)  # copy
+    labels = list(alg_labels)
+    # optional friction handle
+    if friction_thresh is not None:
+        friction_handle = Line2D([0], [0], color="#686565", alpha=0.5, linestyle="--", lw=4)
+        handles.append(friction_handle)
+        labels.append(f"Friction Threshold")
+    handles += [start_handle, goal_handle]
+    labels += ["Start", "Goal"]
+
+    # Force one row; if many entries this will be long — keeps inline appearance
+    ncol = len(handles)
+    leg = fig.legend(
+        handles, labels,
+        loc="upper center",
+        bbox_to_anchor=(0.50, 1.025),  # small vertical offset above figure
+        ncol=ncol,
+        frameon=True,
+        fancybox=True,
+        edgecolor="0.2",
+        handlelength=1.5,
+        columnspacing=0.3,
+        prop={"size": mpl.rcParams.get("legend.fontsize", 12)}
+    )
+    if leg is not None:
+        leg.set_zorder(100)
+        # enforce same sans-serif family for legend texts
+        for text in leg.get_texts():
+            text.set_fontfamily("DejaVu Sans")
+
+    # Reserve room for legend and tighten layout:
+    # rect top < 1 leaves room above subplots for the legend.
+    fig.tight_layout(rect=[0.03, 0.05, 0.99, 0.99])
+
+    # Further tweak spacing to reduce inter-panel whitespace but keep labels/titles visible
+    fig.subplots_adjust(wspace=0.4, left=0.06, right=0.99, top=0.80, bottom=0.18)
+
+    # Save (PDF preferred), use bbox_inches='tight' to avoid clipping on save
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    # determine base name (without extension) for both pdf and svg
+    if outpath is None:
+        base = f"compare_block_results_{timestamp}"
+    else:
+        s = str(outpath)
+        if os.path.isdir(outpath):
+            base = os.path.join(outpath, f"compare_block_results_{timestamp}")
+        else:
+            # if user provided a filename with .pdf or .svg, strip the extension and reuse base
+            if s.lower().endswith(".pdf") or s.lower().endswith(".svg"):
+                base = s[:-4]
+            else:
+                base = s.rstrip('/')
+
+    outname_pdf = f"{base}.pdf"
+    outname_svg = f"{base}.svg"
+
+    # attempt to save both formats, warn on failure but continue
+    try:
+        fig.savefig(outname_pdf, dpi=dpi, bbox_inches="tight", facecolor="white", format="pdf")
+    except Exception:
+        warnings.warn(f"Failed to save figure to {outname_pdf}")
+
+    try:
+        # SVG preserves vector elements and allows editing (deleting/moving) in editors like Inkscape
+        fig.savefig(outname_svg, dpi=dpi, bbox_inches="tight", facecolor="white", format="svg")
+    except Exception:
+        warnings.warn(f"Failed to save figure to {outname_svg}")
+
     plt.show()
+    return fig, axs
+
+def plot_compare_pendulum_results(algorithms, x0, xg, modelparams, outpath=None, figsize=(14, 5), dpi=300, friction_thresh=None):
+    """
+    Compact 3-panel comparison for block problem with a single inline (one-row) legend
+    placed above the panels.
+
+    New optional argument:
+      - friction_thresh: float or None (default None). If provided, a horizontal dashed red
+        line is drawn on the Input vs Time subplot and an entry for it is added to the legend.
+
+    This variant:
+      - reserves space for the legend so it doesn't overlap titles
+      - reduces inter-panel whitespace
+      - ensures top/bottom text is not clipped when showing or saving
+    Returns (fig, axs).
+    """
+    import time, os, warnings
+    import numpy as np
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.lines import Line2D
+    from cycler import cycler
+    from matplotlib.ticker import MaxNLocator
+    from matplotlib.ticker import LogLocator
+
+    # Appearance
+    sns.set_context("notebook", font_scale=1.0)
+    n_alg = max(1, len(algorithms))
+    palette = sns.color_palette("flare", n_colors=max(4, n_alg))
+    # linestyles = [(0, (1, 1)), (0, (3, 1, 1, 1)), '-.', '-']
+    linestyles = [(0,(0.5,0.5)), (0,(2,1)), (0,(4,1,2,1)), '-']
+
+    mpl.rcParams.update({
+        "mathtext.fontset": "stixsans",
+        "font.family": "sans-serif",
+        "font.sans-serif": ["DejaVu Sans"],
+        "text.usetex": False,
+        "mathtext.default": "regular",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "figure.figsize": figsize,
+        "lines.linewidth": 2.0,
+        "axes.labelsize": 30,
+        "axes.titlesize": 30,
+        "legend.fontsize": 20,
+        "xtick.labelsize": 20,
+        "ytick.labelsize": 20,
+    })
+    mpl.rcParams["axes.prop_cycle"] = cycler("color", palette) + cycler(
+        "linestyle", [linestyles[i % len(linestyles)] for i in range(len(palette))]
+    )
+
+    # Create figure and axes. constrained_layout left off so we can reserve space explicitly.
+    fig, axs = plt.subplots(1, 3, figsize=figsize, constrained_layout=False)
+    ax_phase, ax_input, ax_cost = axs
+
+    # safe dt
+    dt = getattr(modelparams, "dt", None)
+    if dt is None:
+        try:
+            dt = float(modelparams["dt"])
+        except Exception:
+            dt = 1.0
+
+    # Build algorithm legend proxies
+    alg_handles, alg_labels = [], []
+    for i, (name, _, _, _) in enumerate(algorithms):
+        color = palette[i % len(palette)]
+        ls = linestyles[i % len(linestyles)]
+        alg_handles.append(Line2D([0], [0], color=color, lw=4, linestyle=ls))
+        alg_labels.append(name)
+
+    # Phase plot (position vs velocity)
+    for i, (_, xbar, _, _) in enumerate(algorithms):
+        xb = np.asarray(xbar)
+        color = palette[i % len(palette)]
+        ls = linestyles[i % len(linestyles)]
+        if xb.ndim == 1:
+            if xb.size >= 2:
+                ax_phase.plot([xb[0]], [xb[1]], marker="o", color=color, linestyle="None")
+            continue
+        if xb.shape[1] >= 2:
+            ax_phase.plot(xb[:, 0], xb[:, 1], color=color, linestyle=ls, lw=4)
+    x0_np = np.asarray(x0); xg_np = np.asarray(xg)
+    ax_phase.scatter(x0_np[0], x0_np[1], color="#1755b1", s=200, marker="o", zorder=5)
+    ax_phase.scatter(xg_np[0], xg_np[1], color="#48e750", s=200, marker="*", zorder=5)
+    ax_phase.set_xlabel(r'$\mathsf{Ang. Position\ (rad)}$'); ax_phase.set_ylabel(r'$\mathsf{Ang. Velocity\ (rad/s)}$')
+    ax_phase.set_title(r'$\mathsf{Phase\ Plot}$'); ax_phase.grid(alpha=0.35)
+
+    # Input vs time
+    for i, (_, _, ubar, _) in enumerate(algorithms):
+        ub = np.asarray(ubar)
+        if ub.ndim == 1:
+            uvals = ub
+        else:
+            uvals = ub[:, 0] if ub.shape[1] >= 1 else ub.flatten()
+        t = np.arange(uvals.shape[0]) * dt
+        ax_input.plot(t, uvals, lw=4)
+    # draw friction threshold if provided
+    if friction_thresh is not None:
+        ax_input.axhline(friction_thresh, color="#686565", linestyle="--", linewidth=3, alpha=0.5, zorder=3)
+    ax_input.set_xlabel(r'$\mathsf{Time\ (s)}$'); ax_input.set_ylabel(r'$\mathsf{Input\ (Nm)}$')
+    ax_input.set_title(r'$\mathsf{Input\ vs\ Time}$'); ax_input.grid(alpha=0.35)
+
+    # Cost vs iteration (log)
+    # limit x-axis to at most 3 nicely spaced integer ticks (first, middle, last)
+    # Configure markers for cost subplot: circular markers with faint (semi-transparent) face colors
+
+    n_series = max(1, len(algorithms))
+    # palette contains RGB tuples; build RGBA for faint face colors
+    mfc = [(*c, 0.22) for c in palette]          # marker facecolor (faint)
+    mec = [c for c in palette]                   # marker edgecolor (opaque)
+    markers = ['o'] * n_series
+    ms = [6] * n_series                          # marker size
+    mew = [1.2] * n_series                       # marker edge width
+
+    # Compose a prop_cycle that includes color, linestyle and marker styling
+    prop = (
+        cycler("color", palette[:n_series])
+        + cycler("linestyle", [linestyles[i % len(linestyles)] for i in range(n_series)])
+        + cycler("marker", markers)
+        + cycler("markerfacecolor", mfc)
+        + cycler("markeredgecolor", mec)
+        + cycler("markersize", ms)
+        + cycler("markeredgewidth", mew)
+    )
+    ax_cost.set_prop_cycle(prop)
+
+    # Use a simple LogLocator for x ticks (at most 3 nice ticks) if desired
+    ax_cost.xaxis.set_major_locator(LogLocator(numticks=3))
+    V_list = [np.asarray(V) for (_, _, _, V) in algorithms if V is not None]
+    if len(V_list) == 0:
+        warnings.warn("No Vstore data provided; cost subplot will be empty.")
+    else:
+        global_min = np.min([np.nanmin(V) for V in V_list])
+        offset = 0.0
+        if global_min <= 0:
+            offset = 1e-12 - float(global_min)
+        for i, (_, _, _, V) in enumerate(algorithms):
+            if V is None:
+                continue
+            Varr = np.asarray(V) + offset
+            # start iterations from 1 instead of 0
+            it = np.arange(1, len(Varr) + 1)
+            ax_cost.plot(it, Varr, lw=4)
+        ax_cost.set_yscale("log")
+        ax_cost.set_xscale("log")
+    ax_cost.set_xlabel(r'$\mathsf{Iteration}$'); ax_cost.set_ylabel(r'$\mathsf{Cost\ (V)}$')
+    ax_cost.set_title(r'$\mathsf{Cost\ vs\ Iteration}$'); ax_cost.grid(which="both", alpha=0.25)
+
+    # Add Start/Goal proxies and optional friction proxy, then create top inline legend.
+    start_handle = Line2D([0], [0], color="#1755b1", marker="o", linestyle="None", markersize=15)
+    goal_handle = Line2D([0], [0], color="#48e750", marker="*", linestyle="None", markersize=15)
+
+    handles = list(alg_handles)  # copy
+    labels = list(alg_labels)
+    # optional friction handle
+    if friction_thresh is not None:
+        friction_handle = Line2D([0], [0], color="#686565", alpha=0.5, linestyle="--", lw=4)
+        handles.append(friction_handle)
+        labels.append(f"Friction Threshold")
+    handles += [start_handle, goal_handle]
+    labels += ["Start", "Goal"]
+
+    # Force one row; if many entries this will be long — keeps inline appearance
+    ncol = len(handles)
+    leg = fig.legend(
+        handles, labels,
+        loc="upper center",
+        bbox_to_anchor=(0.50, 1.025),  # small vertical offset above figure
+        ncol=ncol,
+        frameon=True,
+        fancybox=True,
+        edgecolor="0.2",
+        handlelength=1.5,
+        columnspacing=0.3,
+        prop={"size": mpl.rcParams.get("legend.fontsize", 12)}
+    )
+    if leg is not None:
+        leg.set_zorder(100)
+        # enforce same sans-serif family for legend texts
+        for text in leg.get_texts():
+            text.set_fontfamily("DejaVu Sans")
+
+    # Reserve room for legend and tighten layout:
+    # rect top < 1 leaves room above subplots for the legend.
+    fig.tight_layout(rect=[0.03, 0.05, 0.99, 0.99])
+
+    # Further tweak spacing to reduce inter-panel whitespace but keep labels/titles visible
+    fig.subplots_adjust(wspace=0.35, left=0.083, right=0.99, top=0.80, bottom=0.18)
+
+    # Save (PDF preferred), use bbox_inches='tight' to avoid clipping on save
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    # determine base name (without extension) for both pdf and svg
+    if outpath is None:
+        base = f"compare_pendulum_results_{timestamp}"
+    else:
+        s = str(outpath)
+        if os.path.isdir(outpath):
+            base = os.path.join(outpath, f"compare_pendulum_results_{timestamp}")
+        else:
+            # if user provided a filename with .pdf or .svg, strip the extension and reuse base
+            if s.lower().endswith(".pdf") or s.lower().endswith(".svg"):
+                base = s[:-4]
+            else:
+                base = s.rstrip('/')
+
+    outname_pdf = f"{base}.pdf"
+    outname_svg = f"{base}.svg"
+
+    # attempt to save both formats, warn on failure but continue
+    try:
+        fig.savefig(outname_pdf, dpi=dpi, bbox_inches="tight", facecolor="white", format="pdf")
+    except Exception:
+        warnings.warn(f"Failed to save figure to {outname_pdf}")
+
+    try:
+        # SVG preserves vector elements and allows editing (deleting/moving) in editors like Inkscape
+        fig.savefig(outname_svg, dpi=dpi, bbox_inches="tight", facecolor="white", format="svg")
+    except Exception:
+        warnings.warn(f"Failed to save figure to {outname_svg}")
+
+    plt.show()
+    return fig, axs
+
+
+def plot_compare_cartpole_results(algorithms, x0, xg, modelparams, outpath=None, figsize=(9, 8), dpi=300, friction_thresh=None):
+    """
+    2x2 comparison for cart-pole block problem using `plot_compare_block_results` as template.
+
+    Layout:
+      - Top-left: Phase plot (cart velocity vs cart position)
+      - Top-right: Phase plot (pendulum angular velocity vs angular position)
+      - Bottom-left: Input vs time
+      - Bottom-right: Cost vs iteration
+
+    Arguments and styling follow `plot_compare_block_results`. Returns (fig, axs).
+    """
+    import time, os, warnings
+    import numpy as np
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.lines import Line2D
+    from cycler import cycler
+    from matplotlib.ticker import MaxNLocator
+    from matplotlib.ticker import LogLocator
+
+    # Appearance
+    sns.set_context("notebook", font_scale=1.0)
+    n_alg = max(1, len(algorithms))
+    palette = sns.color_palette("flare", n_colors=max(4, n_alg))
+    linestyles = [(0,(0.5,0.5)), (0,(2,1)), (0,(4,1,2,1)), '-']
+
+    mpl.rcParams.update({
+        "mathtext.fontset": "stixsans",
+        "font.family": "sans-serif",
+        "font.sans-serif": ["DejaVu Sans"],
+        "text.usetex": False,
+        "mathtext.default": "regular",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "figure.figsize": figsize,
+        "lines.linewidth": 2.0,
+        "axes.labelsize": 24,
+        "axes.titlesize": 26,
+        "legend.fontsize": 18,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+    })
+    mpl.rcParams["axes.prop_cycle"] = cycler("color", palette) + cycler(
+        "linestyle", [linestyles[i % len(linestyles)] for i in range(len(palette))]
+    )
+
+    # Create 2x2 figure
+    fig, axs = plt.subplots(2, 2, figsize=figsize, constrained_layout=False)
+    ax_phase1 = axs[0, 0]  # cart phase: vel vs pos
+    ax_phase2 = axs[0, 1]  # pendulum phase: ang vel vs ang pos
+    ax_input = axs[1, 0]
+    ax_cost = axs[1, 1]
+
+    # safe dt
+    dt = getattr(modelparams, "dt", None)
+    if dt is None:
+        try:
+            dt = float(modelparams["dt"])
+        except Exception:
+            dt = 1.0
+
+    # Build algorithm legend proxies
+    alg_handles, alg_labels = [], []
+    for i, (name, _, _, _) in enumerate(algorithms):
+        color = palette[i % len(palette)]
+        ls = linestyles[i % len(linestyles)]
+        alg_handles.append(Line2D([0], [0], color=color, lw=4, linestyle=ls))
+        alg_labels.append(name)
+
+    # Phase plots
+    for i, (_, xbar, _, _) in enumerate(algorithms):
+        xb = np.asarray(xbar)
+        color = palette[i % len(palette)]
+        ls = linestyles[i % len(linestyles)]
+        # If 1D final state vector
+        if xb.ndim == 1:
+            if xb.size >= 4:
+                # cart
+                ax_phase1.plot([xb[0]], [xb[1]], marker="o", color=color, linestyle="None")
+                # pendulum
+                ax_phase2.plot([xb[2]], [xb[3]], marker="o", color=color, linestyle="None")
+            elif xb.size >= 2:
+                ax_phase1.plot([xb[0]], [xb[1]], marker="o", color=color, linestyle="None")
+            continue
+        # If trajectory
+        if xb.shape[1] >= 2:
+            # cart: x position (idx 0) vs cart vel (idx 1)
+            ax_phase1.plot(xb[:, 0], xb[:, 1], color=color, linestyle=ls, lw=3)
+        if xb.shape[1] >= 4:
+            # pendulum: angular position (idx 2) vs angular vel (idx 3)
+            ax_phase2.plot(xb[:, 2], xb[:, 3], color=color, linestyle=ls, lw=3)
+
+    x0_np = np.asarray(x0); xg_np = np.asarray(xg)
+    # Start/Goal markers for cart phase
+    if x0_np.size >= 2:
+        ax_phase1.scatter(x0_np[0], x0_np[1], color="#1755b1", s=150, marker="o", zorder=5)
+    if xg_np.size >= 2:
+        ax_phase1.scatter(xg_np[0], xg_np[1], color="#48e750", s=150, marker="*", zorder=5)
+    ax_phase1.set_xlabel(r'$\mathsf{Position\ (m)}$')
+    ax_phase1.set_ylabel(r'$\mathsf{Velocity\ (m/s)}$')
+    ax_phase1.set_title(r'$\mathsf{Phase\ Plot\ (Cart)}$')
+    ax_phase1.grid(alpha=0.35)
+
+    # Start/Goal markers for pendulum phase
+    if x0_np.size >= 4:
+        ax_phase2.scatter(x0_np[2], x0_np[3], color="#1755b1", s=150, marker="o", zorder=5)
+    if xg_np.size >= 4:
+        ax_phase2.scatter(xg_np[2], xg_np[3], color="#48e750", s=150, marker="*", zorder=5)
+    ax_phase2.set_xlabel(r'$\mathsf{Angle\ (rad)}$')
+    ax_phase2.set_ylabel(r'$\mathsf{Angular\ Velocity\ (rad/s)}$')
+    ax_phase2.set_title(r'$\mathsf{Phase\ Plot\ (Pole)}$')
+    ax_phase2.grid(alpha=0.35)
+
+    # Input vs time
+    for i, (_, _, ubar, _) in enumerate(algorithms):
+        ub = np.asarray(ubar)
+        if ub.ndim == 1:
+            uvals = ub
+        else:
+            uvals = ub[:, 0] if ub.shape[1] >= 1 else ub.flatten()
+        t = np.arange(uvals.shape[0]) * dt
+        ax_input.plot(t, uvals, lw=3)
+    if friction_thresh is not None:
+        ax_input.axhline(friction_thresh, color="#686565", linestyle="--", linewidth=3, alpha=0.5, zorder=3)
+    ax_input.set_xlabel(r'$\mathsf{Time\ (s)}$'); ax_input.set_ylabel(r'$\mathsf{Input\ (N)}$')
+    ax_input.set_title(r'$\mathsf{Input\ vs\ Time}$'); ax_input.grid(alpha=0.35)
+
+    # Cost vs iteration (log)
+    n_series = max(1, len(algorithms))
+    mfc = [(*c, 0.22) for c in palette]
+    mec = [c for c in palette]
+    markers = ['o'] * n_series
+    ms = [6] * n_series
+    mew = [1.2] * n_series
+
+    prop = (
+        cycler("color", palette[:n_series])
+        + cycler("linestyle", [linestyles[i % len(linestyles)] for i in range(n_series)])
+        + cycler("marker", markers)
+        + cycler("markerfacecolor", mfc)
+        + cycler("markeredgecolor", mec)
+        + cycler("markersize", ms)
+        + cycler("markeredgewidth", mew)
+    )
+    ax_cost.set_prop_cycle(prop)
+    ax_cost.xaxis.set_major_locator(LogLocator(numticks=3))
+    V_list = [np.asarray(V) for (_, _, _, V) in algorithms if V is not None]
+    if len(V_list) == 0:
+        warnings.warn("No Vstore data provided; cost subplot will be empty.")
+    else:
+        global_min = np.min([np.nanmin(V) for V in V_list])
+        offset = 0.0
+        if global_min <= 0:
+            offset = 1e-12 - float(global_min)
+        for i, (_, _, _, V) in enumerate(algorithms):
+            if V is None:
+                continue
+            Varr = np.asarray(V) + offset
+            it = np.arange(1, len(Varr) + 1)
+            ax_cost.plot(it, Varr, lw=3)
+        ax_cost.set_yscale("log")
+        ax_cost.set_xscale("log")
+    ax_cost.set_xlabel(r'$\mathsf{Iteration}$'); ax_cost.set_ylabel(r'$\mathsf{Cost\ (V)}$')
+    ax_cost.set_title(r'$\mathsf{Cost\ vs\ Iteration}$'); ax_cost.grid(which="both", alpha=0.25)
+
+    # Legend: start/goal + optional friction + algorithm entries
+    start_handle = Line2D([0], [0], color="#1755b1", marker="o", linestyle="None", markersize=12)
+    goal_handle = Line2D([0], [0], color="#48e750", marker="*", linestyle="None", markersize=12)
+
+    handles = list(alg_handles)
+    labels = list(alg_labels)
+    if friction_thresh is not None:
+        friction_handle = Line2D([0], [0], color="#686565", alpha=0.5, linestyle="--", lw=3)
+        handles.append(friction_handle)
+        labels.append("Friction Threshold")
+    handles += [start_handle, goal_handle]
+    labels += ["Start", "Goal"]
+
+    ncol = len(handles)
+    leg = fig.legend(
+        handles, labels,
+        loc="upper center",
+        bbox_to_anchor=(0.50, 1.00),
+        ncol=ncol,
+        frameon=True,
+        fancybox=True,
+        edgecolor="0.2",
+        handlelength=1.5,
+        columnspacing=0.3,
+        prop={"size": mpl.rcParams.get("legend.fontsize", 12)}
+    )
+    if leg is not None:
+        leg.set_zorder(100)
+        for text in leg.get_texts():
+            text.set_fontfamily("DejaVu Sans")
+
+    # Tighten layout leaving room above for legend
+    fig.tight_layout(rect=[0.03, 0.03, 0.99, 0.98])
+
+    # Further tweak spacing to reduce inter-panel whitespace but keep labels/titles visible
+    fig.subplots_adjust(wspace=0.295, left=0.12, right=0.99, top=0.876, bottom=0.1)
+
+    # Save (PDF preferred), use bbox_inches='tight' to avoid clipping on save
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    # determine base name (without extension) for both pdf and svg
+    if outpath is None:
+        base = f"compare_cartpole_results_{timestamp}"
+    else:
+        s = str(outpath)
+        if os.path.isdir(outpath):
+            base = os.path.join(outpath, f"compare_cartpole_results_{timestamp}")
+        else:
+            # if user provided a filename with .pdf or .svg, strip the extension and reuse base
+            if s.lower().endswith(".pdf") or s.lower().endswith(".svg"):
+                base = s[:-4]
+            else:
+                base = s.rstrip('/')
+
+    outname_pdf = f"{base}.pdf"
+    outname_svg = f"{base}.svg"
+
+    # attempt to save both formats, warn on failure but continue
+    try:
+        fig.savefig(outname_pdf, dpi=dpi, bbox_inches="tight", facecolor="white", format="pdf")
+    except Exception:
+        warnings.warn(f"Failed to save figure to {outname_pdf}")
+
+    try:
+        # SVG preserves vector elements and allows editing (deleting/moving) in editors like Inkscape
+        fig.savefig(outname_svg, dpi=dpi, bbox_inches="tight", facecolor="white", format="svg")
+    except Exception:
+        warnings.warn(f"Failed to save figure to {outname_svg}")
+
+    plt.show()
+
+    return fig, axs
 
 # endregion: Plotting Functions

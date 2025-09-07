@@ -182,7 +182,7 @@ class AlgorithmParams:
         def __init__(self,
                      beta: float = 0.5,
                      gamma: float = 0.01,
-                     use_second_order_info: bool = False,
+                     use_second_order_info: bool = True,
                      max_iters: int = 200,
                      max_fi_iters: int = 50,
                      eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),

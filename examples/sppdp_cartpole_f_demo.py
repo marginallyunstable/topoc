@@ -22,7 +22,7 @@ modelparams = ModelParams(
 )
 
 # Define initial and goal states
-x0 = jnp.array([0.0, 0.0, 0.0, 0.0])
+x0 = jnp.array([-1.0, 0.0, 0.0, 0.0])
 covx0 = 1e-6 * jnp.eye(state_dim)
 xg = jnp.array([0.0, 0.0, jnp.pi, 0.0])
 # Define initial input (control)
@@ -38,7 +38,7 @@ P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
 R = 1*jnp.eye(input_dim)
 
-params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "pl": 0.5}
+params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "pl": 0.5, "dt": dt}
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
@@ -65,6 +65,7 @@ toprob = TOProblemDefinition(
 # Define SPPDP algorithm parameters (example values)
 algorithm = TOAlgorithm(
     AlgorithmName.SPPDP,
+    use_second_order_info=True,
     spg_method='gh_ws',
     spg_params={"order": 5},
     eta=0.01,
@@ -73,7 +74,7 @@ algorithm = TOAlgorithm(
     zeta_factor=2,
     zeta_min=1e-2,
     sigma_u=1e-2,
-    max_iters=50,
+    max_iters=100,
 )
 
 print("Algorithm parameters:")

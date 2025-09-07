@@ -64,8 +64,10 @@ algorithm = TOAlgorithm(
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=500,
+    mcsamples=5,
     max_iters=50,
+    spg_method='g_ws',
+    spg_params={"order": 100},
 )
 
 print("Algorithm parameters:")

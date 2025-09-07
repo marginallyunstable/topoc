@@ -51,7 +51,7 @@ class RDDP1():
 
         # region: Algorithm Iterations
 
-        iter = 0
+        iter = 1
         Change = jnp.inf
         Vstore = [Vbar]
         regularization = 0.0
@@ -87,6 +87,7 @@ class RDDP1():
 
                     if not success:
                         regularization = max(regularization * 4, 1e-3)
+                        print(f"Backward Pass failed. Setting regularization to: {regularization}")
 
                 regularization = regularization / 20
                 if regularization < 1e-6:
@@ -98,8 +99,9 @@ class RDDP1():
                     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm
                 )
 
-                if not done:
+                if not done or iter > self.toalgorithm.params.max_iters:
                     Vstore.append(Vprev)
+                    print(f"Iter value: {iter}")
                     print(f"Line Search exhausted. dV value expected was: {dV}")
                     break
 
@@ -115,7 +117,7 @@ class RDDP1():
                 (alpha <= self.toalgorithm.params.targetalpha and
                  sigma_x <= self.toalgorithm.params.sigma_x/1e-6 and
                  sigma_u <= self.toalgorithm.params.sigma_u/1e-6)
-                or iter == self.toalgorithm.params.max_iters
+                or iter > self.toalgorithm.params.max_iters
                 or Change <= self.toalgorithm.params.stopping_criteria
             ):
                 print(f"Converged in {iter} iteration(s). [Outer Loop]")

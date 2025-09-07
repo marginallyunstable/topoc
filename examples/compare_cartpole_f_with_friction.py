@@ -11,7 +11,7 @@ from topoc.types import ModelParams, AlgorithmName
 # Define model parameters (example values)
 state_dim = 4
 input_dim = 1
-horizon_len = 400
+horizon_len = 200
 dt = 0.01
 
 modelparams = ModelParams(
@@ -30,9 +30,9 @@ u0 = jnp.array([0.0])
 
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 1*jnp.eye(input_dim)
+R = 500*jnp.eye(input_dim)
 
-params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "pl": 0.5}
+params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 0.5}
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
@@ -57,7 +57,7 @@ toprob_ddp = TOProblemDefinition(
 
 algorithm_ddp = TOAlgorithm(AlgorithmName.DDP, 
                             use_second_order_info=True, # NOTE
-                            max_iters=50)
+                            max_iters=150)
 
 tosolve_ddp = TOSolve(toprob_ddp, algorithm_ddp)
 xbar_ddp, ubar_ddp, Vstore_ddp = tosolve_ddp.result.xbar, tosolve_ddp.result.ubar, tosolve_ddp.result.Vstore
@@ -82,19 +82,18 @@ algorithm_rddp1 = TOAlgorithm(
     AlgorithmName.RDDP1,
     use_second_order_info=False, # NOTE
     sigma_x=1e-6,
-    sigma_u=10,
+    sigma_u=15,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=500, # NOTE
-    max_iters=50,
-    spg_method='gh_ws',
-    spg_params={"order": 5},
+    max_iters=150,
+    spg_method='g_ws',
+    spg_params={"order": 5**5},
 )
 
-# Example usage: create and solve the problem with RDDP1
+# # Example usage: create and solve the problem with RDDP1
 tosolve_rddp1 = TOSolve(toprob_rddp1, algorithm_rddp1)
 xbar_rddp1, ubar_rddp1, Vstore_rddp1 = tosolve_rddp1.result.xbar, tosolve_rddp1.result.ubar, tosolve_rddp1.result.Vstore
 
@@ -118,15 +117,14 @@ toprob_rddp2 = TOProblemDefinition(
 algorithm_rddp2 = TOAlgorithm(
     AlgorithmName.RDDP2,
     use_second_order_info=False,   # NOTE
-    sigma=10,
+    sigma=15,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=500, # NOTE
-    max_iters=50,
-    spg_method='gh_ws',
+    max_iters=150,
+    spg_method='g_ws',
     spg_params={"order": 5},
 )
 
@@ -152,15 +150,16 @@ toprob_sppdp = TOProblemDefinition(
 # Define SPPDP algorithm parameters (example values)
 algorithm_sppdp = TOAlgorithm(
     AlgorithmName.SPPDP,
+    use_second_order_info=False,   # NOTE
     spg_method='gh_ws',
-    spg_params={"order": 6},
+    spg_params={"order": 5},
     eta=0.01,
     lam=100,
     zeta=1,
     zeta_factor=2,
     zeta_min=1e-2,
     sigma_u=15,
-    max_iters=50
+    max_iters=150
 )
 
 
@@ -174,9 +173,9 @@ xbar_sppdp, ubar_sppdp, Vstore_sppdp = tosolve_sppdp.result.xbar, tosolve_sppdp.
 # recreate algorithms list and call the beautified plotting function
 algorithms = [
     ("DDP", xbar_ddp, ubar_ddp, Vstore_ddp),
-    ("RDDP1", xbar_rddp1, ubar_rddp1, Vstore_rddp1),
-    ("RDDP2", xbar_rddp2, ubar_rddp2, Vstore_rddp2),
-    # ("SPPDP", xbar_sppdp, ubar_sppdp, Vstore_sppdp),
+    ("SCS-DDP", xbar_rddp1, ubar_rddp1, Vstore_rddp1),
+    ("CS-DDP", xbar_rddp2, ubar_rddp2, Vstore_rddp2),
+    ("P-PDP", xbar_sppdp, ubar_sppdp, Vstore_sppdp),
 ]
 
 plot_compare_cartpole_results(algorithms, x0, xg, modelparams)

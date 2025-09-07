@@ -32,7 +32,7 @@ u0 = jnp.array([0.0])
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 5*jnp.eye(input_dim)
+R = 50*jnp.eye(input_dim)
 
 params_dynamics = {"m": 1.0, "dt": dt}
 params_terminal = {"P": P}
@@ -56,16 +56,18 @@ toprob = TOProblemDefinition(
 # Define RDDP1 algorithm parameters (example values)
 algorithm = TOAlgorithm(
     AlgorithmName.RDDP1,
-    use_second_order_info=False,
+    use_second_order_info=True,
     sigma_x=1e-6,
-    sigma_u=20,
+    sigma_u=10,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=1000,
+    mcsamples=5,
     max_iters=50,
+    spg_method='gh_ws',
+    spg_params={"order": 10},
 )
 
 print("Algorithm parameters:")

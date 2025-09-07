@@ -33,7 +33,7 @@ u0 = jnp.array([0.0])
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 5*jnp.eye(input_dim)
+R = 50*jnp.eye(input_dim)
 
 params_dynamics = {"m": 1.0, "dt": dt}
 params_terminal = {"P": P}
@@ -79,18 +79,17 @@ toprob_rddp1 = TOProblemDefinition(
 # Define RDDP1 algorithm parameters (example values)
 algorithm_rddp1 = TOAlgorithm(
     AlgorithmName.RDDP1,
-    use_second_order_info=True, # NOTE
+    use_second_order_info=False, # NOTE
     sigma_x=1e-6,
-    sigma_u=20,
+    sigma_u=10,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=1000, # NOTE
     max_iters=50,
-    spg_method='gh_ws',
-    spg_params={"order": 5},
+    spg_method='g_ws',
+    spg_params={"order": 6**3},
 )
 
 # Example usage: create and solve the problem with RDDP1
@@ -116,17 +115,16 @@ toprob_rddp2 = TOProblemDefinition(
 # Define RDDP2 algorithm parameters (example values)
 algorithm_rddp2 = TOAlgorithm(
     AlgorithmName.RDDP2,
-    use_second_order_info=True,
-    sigma=20,
+    use_second_order_info=False,
+    sigma=10,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=500,
     max_iters=50,
-    spg_method='gh_ws',
-    spg_params={"order": 5},
+    spg_method='g_ws',
+    spg_params={"order": 6},
 )
 
 tosolve_rddp2 = TOSolve(toprob_rddp2, algorithm_rddp2)
@@ -151,14 +149,15 @@ toprob_sppdp = TOProblemDefinition(
 # Define SPPDP algorithm parameters (example values)
 algorithm_sppdp = TOAlgorithm(
     AlgorithmName.SPPDP,
+    use_second_order_info=False,
     spg_method='gh_ws',
-    spg_params={"order": 5},
+    spg_params={"order": 6},
     eta=0.01,
     lam=100,
     zeta=1,
     zeta_factor=2,
     zeta_min=1e-2,
-    sigma_u=20,
+    sigma_u=30,
     max_iters=50
 )
 
@@ -172,9 +171,9 @@ xbar_sppdp, ubar_sppdp, Vstore_sppdp = tosolve_sppdp.result.xbar, tosolve_sppdp.
 # recreate algorithms list and call the beautified plotting function
 algorithms = [
     ("DDP", xbar_ddp, ubar_ddp, Vstore_ddp),
-    ("RDDP1", xbar_rddp1, ubar_rddp1, Vstore_rddp1),
-    ("RDDP2", xbar_rddp2, ubar_rddp2, Vstore_rddp2),
-    ("SPPDP", xbar_sppdp, ubar_sppdp, Vstore_sppdp),
+    ("SCS-DDP", xbar_rddp1, ubar_rddp1, Vstore_rddp1),
+    ("CS-DDP", xbar_rddp2, ubar_rddp2, Vstore_rddp2),
+    ("P-PDP", xbar_sppdp, ubar_sppdp, Vstore_sppdp),
 ]
 
-plot_compare_block_results(algorithms, x0, xg, modelparams)
+plot_compare_block_results(algorithms, x0, xg, modelparams, friction_thresh=7.848)

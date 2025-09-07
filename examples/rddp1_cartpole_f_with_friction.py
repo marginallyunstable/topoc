@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from functools import partial
 from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_cartpole_results
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
-from models.cartpole import cartpole_f_with_friction, cartpole_with_friction  # Assumes this exists
+from models.cartpole import cartpole_f_with_friction  # Assumes this exists
 from topoc.types import ModelParams, AlgorithmName
 
 # Define model parameters (example values)
@@ -22,7 +22,7 @@ modelparams = ModelParams(
 )
 
 # Define initial and goal states
-x0 = jnp.array([0.0, 0.0, 0.0, 0.0])
+x0 = jnp.array([-1.0, 0.0, 0.0, 0.0])
 xg = jnp.array([0.0, 0.0, jnp.pi, 0.0])
 # Define initial input (control)
 u0 = jnp.array([0.0])
@@ -32,7 +32,7 @@ P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
 R = 1*jnp.eye(input_dim)
 
-params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 1.0, "dt": dt}
+params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 0.5, "dt": dt}
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
@@ -55,17 +55,18 @@ toprob = TOProblemDefinition(
 # Define RDDP1 algorithm parameters (example values)
 algorithm = TOAlgorithm(
     AlgorithmName.RDDP1,
-    use_second_order_info=False,
+    use_second_order_info=False, # NOTE
     sigma_x=1e-6,
-    sigma_u=25,
+    sigma_u=10,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=2000,
-    max_iters=35,
-    max_fi_iters=50
+    mcsamples=500, # NOTE
+    max_iters=50,
+    spg_method='gh_ws',
+    spg_params={"order": 5},
 )
 
 print("Algorithm parameters:")
