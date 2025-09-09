@@ -5,6 +5,9 @@ import viser
 
 def main():
     server = viser.ViserServer()
+    
+    # Configure GUI to use small control panel
+    server.gui.configure_theme(control_width="small")
 
     # Add 3D objects to the scene
     sphere = server.scene.add_icosphere(

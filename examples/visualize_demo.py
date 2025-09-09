@@ -5,6 +5,10 @@ import viser
 
 def main():
     server = viser.ViserServer()
+    
+    # Configure GUI to use small control panel
+    server.gui.configure_theme(control_width="small")
+    
     server.scene.add_icosphere(
         name="hello_sphere",
         radius=0.5,
