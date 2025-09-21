@@ -1,4 +1,6 @@
 import jax
+from jax import config
+config.update("jax_enable_x64", True)
 from typing import NamedTuple, Callable, Tuple
 from jax import Array
 from enum import Enum
@@ -37,63 +39,47 @@ HessianDynamicsFn = Callable[
 
 class AlgorithmName(Enum):
     DDP = "DDP: Vanilla DDP"
-    RDDP1 = "RDDP1: Randomized DDP with Smoothing in state and control space"
-    RDDP2 = "RDDP2: Randomized DDP with Smoothing only in control space"
-    SPDP = "SPDDP: Sigma Point Dynamic Programming"
-    SPPDP = "SPPDP: Sigma Point Probabilistic Dynamic Programming"
+    SCSDDP = "SCSDDP: Randomized DDP with Smoothing in state and control space"
+    CSDDP = "CSDDP: Randomized DDP with Smoothing only in control space"
+    PDDP = "PDDP: Probabilistic DDP"
 
 class AlgorithmParams:
     """
     Namespace for all algorithm parameter classes.
         Common parameters for all algorithms:
-            beta: line search reduction parameter
-            gamma: scaling(reduction) factor for dV 
             use_second_order_info: whether to use second order information in the algorithm
             max_iters: maximum number of iterations for the algorithm
-            max_fi_iters: maximum number of backtracking steps for forward iteration
             stopping criteria: if this change in value function is reached, the algorithm stops
     """
 
-    
-
     class DDPParams:
         def __init__(self,
-                     beta: float = 0.5,
-                     gamma: float = 0.01,
                      use_second_order_info: bool = False,
                      max_iters: int = 200,
-                     max_fi_iters: int = 50,
                      eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-9):
-            self.beta = beta
-            self.gamma = gamma
             self.use_second_order_info = use_second_order_info
             self.max_iters = max_iters
-            self.max_fi_iters = max_fi_iters
             self.eps_list = eps_list
             self.stopping_criteria = stopping_criteria
 
-    class RDDP1Params:
+    class SCSDDPParams:
         """
-        RDDP1 Parameters
-            alpha: with this change in value function perform next DDP iteration with reduced noise
-            alpha_red: reduction factor for alpha for next iteration
+        SCSDDP Parameters
+            alpha: precision for DDP problem
+            alpha_red: reduction factor for precision for next iteration
             sigma_x: initial noise for state space
             sigma_u: initial noise for control space
             sigma_red: reduction factor for sigma_x for next iteration
-            targetalpha: target value for alpha to stop the algorithm
+            targetalpha: target value for precision to stop the algorithm
             targetsigma: target value for sigma to stop the algorithm
-            mcsamples: number of samples for Monte Carlo estimation
         """
         def __init__(self,
-                     beta: float = 0.5,
-                     gamma: float = 0.01,
                      use_second_order_info: bool = False,
                      max_iters: int = 200,
-                     max_fi_iters: int = 50,
                      eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-6,
-                     # RDDP2 specific parameters
+                     # CSDDP specific parameters
                      alpha: float = 10, # change in value function
                      alpha_red: float = 2.0,
                      sigma_x: float = 2.0,
@@ -101,15 +87,11 @@ class AlgorithmParams:
                      sigma_red: float = 2.0,
                      targetalpha: float = 1e-6,
                      targetsigma: float = 1e-6,
-                     mcsamples: int = 50,
-                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
+                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws', 'g_ws'
                      spg_params: dict = None,  # Parameters for the SPG method
                      ):
-            self.beta = beta
-            self.gamma = gamma
             self.use_second_order_info = use_second_order_info
             self.max_iters = max_iters
-            self.max_fi_iters = max_fi_iters
             self.eps_list = eps_list
             self.stopping_criteria = stopping_criteria
             self.alpha = alpha
@@ -119,41 +101,35 @@ class AlgorithmParams:
             self.sigma_red = sigma_red
             self.targetalpha = targetalpha  
             self.targetsigma = targetsigma
-            self.mcsamples = mcsamples
             self.spg_method = spg_method
             self.spg_params = {"order": 5, **(spg_params or {})}
-    class RDDP2Params:
+    
+    class CSDDPParams:
         """
-        RDDP2 Parameters
-            alpha: with this change in value function perform next DDP iteration with reduced noise
-            alpha_red: reduction factor for alpha for next iteration
+        CSDDP Parameters
+            alpha: precision for DDP problem
+            alpha_red: reduction factor for precision for next iteration
             sigma: initial noise for control space
             sigma_red: reduction factor for sigma for next iteration
-            targetalpha: target value for alpha to stop the algorithm
+            targetalpha: target value for precision to stop the algorithm
             targetsigma: target value for sigma to stop the algorithm
-            mcsamples: number of samples for Monte Carlo estimation
         """
         def __init__(self,
-                     beta: float = 0.5,
-                     gamma: float = 0.01,
                      use_second_order_info: bool = False,
                      max_iters: int = 200,
                      max_fi_iters: int = 50,
                      eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-6,
-                     # RDDP2 specific parameters
+                     # CSDDP specific parameters
                      alpha: float = 10, # change in value function
                      alpha_red: float = 2.0,
                      sigma: float = 2.0,
                      sigma_red: float = 2.0,
                      targetalpha: float = 1e-6,
                      targetsigma: float = 1e-6,
-                     mcsamples: int = 50,
-                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
+                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws', 'g_ws'
                      spg_params: dict = None,  # Parameters for the SPG method
                      ):
-            self.beta = beta
-            self.gamma = gamma
             self.use_second_order_info = use_second_order_info
             self.max_iters = max_iters
             self.max_fi_iters = max_fi_iters
@@ -165,13 +141,12 @@ class AlgorithmParams:
             self.sigma_red = sigma_red
             self.targetalpha = targetalpha  
             self.targetsigma = targetsigma
-            self.mcsamples = mcsamples
             self.spg_method = spg_method
             self.spg_params = {"order": 5, **(spg_params or {})}
 
-    class SPPDPParams:
+    class PDDPParams:
         """
-        SPPDP Parameters
+        PDDP Parameters
             spg_method: method for sigma point generation
             sigma_x: initial noise for state space
             sigma_u: initial noise for control space
@@ -180,28 +155,21 @@ class AlgorithmParams:
             targetsigma: target value for sigma to stop the algorithm
         """
         def __init__(self,
-                     beta: float = 0.5,
-                     gamma: float = 0.01,
                      use_second_order_info: bool = True,
                      max_iters: int = 200,
-                     max_fi_iters: int = 50,
                      eps_list: Array = 10.0 ** jax.numpy.linspace(0.0, -3.0, 11),
                      stopping_criteria: float = 1e-6,
-                     # SPPDP specific parameters
-                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws'
+                     # PDDP specific parameters
+                     spg_method: str = 'gh_ws',  # Allowed: 'gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws', 'g_ws'
                      spg_params: dict = None,  # Parameters for the SPG method
                      eta: float = 1,  # forget factor for control policy
                      lam: float = 100.0,  # temperature parameter
                      zeta: float = 1.0,  # temperature change parameter
                      zeta_factor: float = 2.0,  # temperature change factor
                      zeta_min: float = 1e-2,  # minimum temperature parameter
-                     sigma_u: float = 2.0,
-                     mcsamples: int = 50):
-            self.beta = beta
-            self.gamma = gamma
+                     sigma_u: float = 2.0):
             self.use_second_order_info = use_second_order_info
             self.max_iters = max_iters
-            self.max_fi_iters = max_fi_iters
             self.eps_list = eps_list
             self.stopping_criteria = stopping_criteria
             self.spg_method = spg_method
@@ -212,22 +180,16 @@ class AlgorithmParams:
             self.zeta_factor = zeta_factor
             self.zeta_min = zeta_min
             self.sigma_u = sigma_u
-            self.mcsamples = mcsamples
-
-    class SPDPParams:
-        def __init__(self, epsilon: float):
-            self.epsilon = epsilon
 
 # Mapping from AlgorithmName to parameter class
 algorithm_param_classes = {
     AlgorithmName.DDP: AlgorithmParams.DDPParams,
-    AlgorithmName.RDDP1: AlgorithmParams.RDDP1Params,
-    AlgorithmName.RDDP2: AlgorithmParams.RDDP2Params,
-    AlgorithmName.SPDP: AlgorithmParams.SPDPParams,
-    AlgorithmName.SPPDP: AlgorithmParams.SPPDPParams,
+    AlgorithmName.SCSDDP: AlgorithmParams.SCSDDPParams,
+    AlgorithmName.CSDDP: AlgorithmParams.CSDDPParams,
+    AlgorithmName.PDDP: AlgorithmParams.PDDPParams,
 }
 
-SPG_METHOD_NAMES = ('gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws')
+SPG_METHOD_NAMES = ('gh_ws', 'sym_set', 'ut5_ws', 'ut7_ws', 'ut9_ws', 'ut3_ws', 'g_ws')
 
 # endregion: TOAlgorithm Parameters
 

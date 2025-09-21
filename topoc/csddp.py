@@ -1,5 +1,7 @@
 from typing import NamedTuple, Callable, Optional, Tuple, Any, TYPE_CHECKING
 from collections import namedtuple
+from jax import config
+config.update("jax_enable_x64", True)
 from functools import partial
 from jax import Array
 import jax
@@ -12,10 +14,9 @@ if TYPE_CHECKING:
 from topoc.types import *
 from topoc.utils import *
 
-class RDDP1():
+class CSDDP():
     """
-    Finite horizon Discrete-time Randomized Differential Dynamic Programming(DDP)
-    This version uses smoothing only in control space.
+    Control Smoothed DDP
     """
 
     def __init__(
@@ -33,8 +34,7 @@ class RDDP1():
         Nx = self.toproblem.modelparams.state_dim
         Nu = self.toproblem.modelparams.input_dim
         H = self.toproblem.modelparams.horizon_len
-        sigma_x = self.toalgorithm.params.sigma_x
-        sigma_u = self.toalgorithm.params.sigma_u
+        sigma = self.toalgorithm.params.sigma
         alpha = self.toalgorithm.params.alpha
 
         # region: Initialize Simulation
@@ -69,39 +69,58 @@ class RDDP1():
 
                 while not success:
 
-                    # trajderivatives = state_input_smoothed_traj_batch_derivatives(
+                    # trajderivatives = input_smoothed_traj_batch_derivatives(
                     #     xbar, ubar, self.toproblem,
-                    #     sigma_x=sigma_x,
-                    #     sigma_u=sigma_u,
+                    #     sigma=sigma,
+                    #     N_samples=self.toalgorithm.params.mcsamples,
+                    #     key=jax.random.PRNGKey(42)
+
+                    # )
+                    trajderivatives = input_smoothed_traj_batch_derivatives_spm(
+                        xbar, ubar, sigma,
+                        self.toproblem, self.toalgorithm,
+                    )
+                    # trajderivatives = input_smoothed_traj_batch_derivatives_qsim_spm(
+                    #     xbar, ubar, sigma,
+                    #     self.toproblem, self.toalgorithm,
+                    # )
+
+                    # trajderivatives = input_smoothed_traj_batch_derivatives_qsim(
+                    #     xbar, ubar, self.toproblem,
+                    #     sigma=sigma,
                     #     N_samples=self.toalgorithm.params.mcsamples,
                     #     key=jax.random.PRNGKey(42)
                     # )
-                    trajderivatives = state_input_smoothed_traj_batch_derivatives_spm(
-                        xbar, ubar, 
-                        sigma_x,
-                        sigma_u, self.toproblem, self.toalgorithm,
-                    )
+                    # trajderivatives = input_smoothed_traj_chunked_batch_derivatives_qsim(
+                    #     xbar, ubar, self.toproblem, chunk_size=5,
+                    #     sigma=sigma,
+                    #     N_samples=self.toalgorithm.params.mcsamples,
+                    #     key=jax.random.PRNGKey(42)
+                    # )
                     dV, success, K, k, Vx, Vxx = backward_pass(trajderivatives,
                                                         regularization,
                                                         use_second_order_info=self.toalgorithm.params.use_second_order_info)
 
+                    # print(f"dV: {dV}")
+                    
                     if not success:
                         regularization = max(regularization * 4, 1e-3)
-                        print(f"Backward Pass failed. Setting regularization to: {regularization}")
 
                 regularization = regularization / 20
                 if regularization < 1e-6:
                     regularization = 0.0
 
+
                 Vprev = Vbar # Store previous value to check post forward iteration
-                
+
                 xbar, ubar, Vbar, eps, done = forward_iteration(
                     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm
                 )
 
+                print(f"Vbar: {Vbar}")
+                
                 if not done or iter > self.toalgorithm.params.max_iters:
                     Vstore.append(Vprev)
-                    print(f"Iter value: {iter}")
                     print(f"Line Search exhausted. dV value expected was: {dV}")
                     break
 
@@ -112,25 +131,30 @@ class RDDP1():
                     print(f"Converged in {iter} iteration(s). [Inner Loop]")
                     break
 
-            # TODO: Change the /100  
+            # if (
+            #     (alpha <= self.toalgorithm.params.targetalpha and
+            #      sigma <= self.toalgorithm.params.targetsigma)
+            #     or iter > self.toalgorithm.params.max_iters
+            #     or Change <= self.toalgorithm.params.stopping_criteria
+            # ):
+            #     print(f"Converged in {iter} iteration(s). [Outer Loop]")
+            #     break
+
             if (
-                (alpha <= self.toalgorithm.params.targetalpha and
-                 sigma_x <= self.toalgorithm.params.sigma_x/1e-6 and
-                 sigma_u <= self.toalgorithm.params.sigma_u/1e-6)
-                or iter > self.toalgorithm.params.max_iters
-                or Change <= self.toalgorithm.params.stopping_criteria
+                iter > self.toalgorithm.params.max_iters
+                or abs(Change) <= self.toalgorithm.params.stopping_criteria
             ):
                 print(f"Converged in {iter} iteration(s). [Outer Loop]")
                 break
 
             
+            print(Vprev)
+            
             print(f"Alpha set from {alpha} to {alpha / self.toalgorithm.params.alpha_red}")
             alpha = alpha / self.toalgorithm.params.alpha_red
 
-            print(f"Sigma_x set from {sigma_x} to {sigma_x / self.toalgorithm.params.sigma_red}")
-            sigma_x = sigma_x / self.toalgorithm.params.sigma_red
-            print(f"Sigma_u set from {sigma_u} to {sigma_u / self.toalgorithm.params.sigma_red}")
-            sigma_u = sigma_u / self.toalgorithm.params.sigma_red
+            print(f"Sigma set from {sigma} to {sigma / self.toalgorithm.params.sigma_red}")
+            sigma = sigma / self.toalgorithm.params.sigma_red
 
         Result = namedtuple('Result', ['xbar', 'ubar', 'Vstore'])
         return Result(xbar=xbar, ubar=ubar, Vstore=Vstore)

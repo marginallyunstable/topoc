@@ -2,6 +2,8 @@
 
 from typing import Callable, Tuple, Any, Optional, TYPE_CHECKING
 import jax
+from jax import config
+config.update("jax_enable_x64", True)
 from jax import random
 from jax import Array, lax, debug, profiler
 import jax.numpy as jnp
@@ -32,16 +34,6 @@ def linearize(fun: Callable) -> Callable:
     """
     Returns a Jacobian function with respect to x and u inputs,
     or just x if only one input. Handles normal functions and functools.partial.
-
-    Returns:
-    - For one argument: Callable[[Array], Array]
-        Returns the Jacobian ∂f/∂x as an array.
-    - For two arguments: Callable[[Array, Array], Tuple[Array, Array]]
-        Returns the tuple of Jacobians (∂f/∂x, ∂f/∂u).
-    Why wrapped?:
-        It ensures that the function you pass to jax.jacrev always takes exactly the
-        arguments you want to differentiate with respect to, regardless of whether the
-        original function is a plain function or a functools.partial.
     """
 
     # Count the number of arguments the function expects after partial application
@@ -337,6 +329,140 @@ def forward_pass_wup(
         new_chol_Covs_Zs = jnp.concatenate([new_chol_Covs_Zs, chol_cov_xf_padded[None, :, :]], axis=0)  # shape (T+1, nx+nu, nx+nu)
 
         return (new_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs), total_cost
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def forward_pass_qsim_wup(
+        Xs: Array,
+        Us: Array,
+        Ks: Array,
+        ks: Array,
+        cov_policy: Array,
+        toproblem: "TOProblemDefinition",
+        toalgorithm: "TOAlgorithm",
+        eps: float = 1.0, # linear search parameter
+    ):
+        """
+        Perform a forward pass with unncertainty propagation.
+
+        Parameters
+        ----------
+        Xs : Array
+            The target state trajectory.
+        Us : Array
+            The control trajectory.
+        Ks : Gains
+            The gains obtained from the Backward Pass.
+        dynamics : Callable
+            The dynamics function of the system.
+        runningcost : Callable
+            The running cost function.
+        finalcost : Callable
+            The final cost function.
+        eps : float, optional
+            The linesearch parameter, by default 1.0.
+
+        Returns
+        -------
+        [[NewStates, NewControls], TotalCost] -> Tuple[Tuple[Array, Array], float]
+            A tuple containing the updated state trajectory and control trajectory, and the total cost
+            of the trajectory.
+        """
+
+        # dynamics = toproblem.dynamics
+        graddynamics = toproblem.graddynamics
+        runningcost = toproblem.runningcost
+        terminalcost = toproblem.terminalcost
+        xdim = toproblem.modelparams.state_dim
+        udim = toproblem.modelparams.input_dim
+        H = toproblem.modelparams.horizon_len
+        dt = toproblem.modelparams.dt
+        xini = toproblem.starting_state
+        cov_xini = toproblem.starting_state_cov
+        spg_func = get_spg_func(toalgorithm.params.spg_method)
+        # spg_func = globals()[toalgorithm.params.spg_method]
+        
+        wsp_r, usp_r = spg_func(xdim + udim, toalgorithm.params.spg_params) # sigma point weights (wsp_r) and unit sigma points (usp_r) for running part of trajectory
+ 
+        def dynamics_step(scan_state, scan_input):
+            x, cov_x, traj_cost = scan_state
+            x_bar, u_bar, K, k, cov_policy = scan_input
+
+            delta_x = x - x_bar
+            delta_u = K @ delta_x + eps * k
+            u = u_bar + delta_u
+
+            cov_uu = cov_policy + K @  cov_x @ K.T
+            cov_ux = K @ cov_x
+
+            cov_z = jnp.block([
+                [cov_x, cov_ux.T],
+                [cov_ux, cov_uu]
+            ]) # shape (nx + nu, nx + nu)
+
+            # chol_cov_z = jax.scipy.linalg.cholesky(cov_z, lower=True)
+            cov_z, chol_cov_z = safe_cholesky_eig(cov_z)  # Ensure positive definiteness
+            
+            
+            # jax.debug.print("cov_z: {}", cov_z)
+            # jax.debug.print("chol_cov_z: {}", chol_cov_z)
+            
+            # Generate sigma points
+            # Stack x and u together
+            z = jnp.concatenate([x, u])  # shape (nx + nu,)
+
+            # Generate sigma points: z + cov_z_sqrt @ usp_r
+            sigma_points = z[:, None] + chol_cov_z @ usp_r  # shape (nz, N_sigma)
+            sigma_points = sigma_points.T  # shape (N_sigma, nz)
+
+            x_sigma_points = sigma_points[:, :xdim]  # shape (N_sigma, nx)
+            u_sigma_points = sigma_points[:, xdim:]  # shape (N_sigma, nu)
+
+            # jax.debug.print("x_sigma_points: {}", x_sigma_points)
+            # jax.debug.print("u_sigma_points: {}", u_sigma_points)
+
+            # transported sigma points to state space through dynamics
+            # jax.debug.print("Transport Start")
+            nx_sigma_points, _, _, _ = graddynamics(x_sigma_points, u_sigma_points) # shape (N_sigma, nx) 
+            # jax.debug.print("Transport End")
+
+            nx = wsp_r @ nx_sigma_points  # shape (nx,)
+
+            # jax.debug.print("nx: {}", nx)
+
+            ncov_x = (nx_sigma_points - nx).T @ (wsp_r[:, None] * (nx_sigma_points - nx))  # shape (nx, nx)
+
+            traj_cost = traj_cost + dt * runningcost(x, u)
+
+            return (nx, ncov_x, traj_cost), (nx, u, sigma_points, nx_sigma_points, cov_z, chol_cov_z)
+
+        (xf, cov_xf, traj_cost), (new_next_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs) = lax.scan(
+            dynamics_step, init=(xini, cov_xini, 0.0), xs=(Xs[:-1], Us, Ks, ks, cov_policy)
+        )
+
+        # jax.debug.print("----")
+        jax.debug.print("dynamics_step End")
+        # jax.debug.print("----")
+        
+        total_cost = traj_cost + terminalcost(xf)
+        new_Xs = jnp.vstack([xini, new_next_Xs])
+
+        # chol_cov_xf = jax.scipy.linalg.cholesky(cov_xf, lower=True)
+        cov_xf, chol_cov_xf = safe_cholesky_eig(cov_xf)  # Ensure positive definiteness
+        
+        
+        # jax.debug.print("cov_xf: {}", cov_xf)
+        # jax.debug.print("chol_cov_xf: {}", chol_cov_xf)
+        
+        pad_width = ((0, udim), (0, udim))  # pad nu zeros to bottom and right
+        cov_xf_padded = jnp.pad(cov_xf, pad_width, mode='constant')
+        new_Covs_Zs = jnp.concatenate([new_Covs_Zs, cov_xf_padded[None, :, :]], axis=0)  # shape (T+1, nx+nu, nx+nu)
+
+        
+        chol_cov_xf_padded = jnp.pad(chol_cov_xf, pad_width, mode='constant')
+        new_chol_Covs_Zs = jnp.concatenate([new_chol_Covs_Zs, chol_cov_xf_padded[None, :, :]], axis=0)  # shape (T+1, nx+nu, nx+nu)
+
+        return (new_Xs, new_Us, new_SPs, new_nX_SPs, new_Covs_Zs, new_chol_Covs_Zs), total_cost
+
 
 @partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
 def forward_pass_wup_mm(
@@ -981,7 +1107,7 @@ def backward_pass_wup(
             def on_pd():
                 
                 X = jnp.eye(m)  # if you need the explicit inverse
-                Cov_policy_reg = jax.numpy.linalg.solve(Cov_policy_inv_reg, X)
+                Cov_policy_reg = jax.numpy.linalg.solve(Cov_policy_inv_reg, X) #+ 1e-6 * jnp.eye(m)
                 k = Cov_policy_reg @ (eta * Cov_policy_inv_ @ k_ - lam * Qu)
                 K = Cov_policy_reg @ (eta * Cov_policy_inv_ @ K_ - lam * Qxu.T)
 
@@ -1539,6 +1665,143 @@ def input_smoothed_traj_batch_derivatives_qsim(
 
     fx_s, fu_s = graddynamics(Xs[:-1], Us, jnp.sqrt(sigma), N_samples)
 
+    # Create zeros for higher-order derivatives
+    N = Xs.shape[0]
+    Nx = Xs.shape[1]
+    Nu = Us.shape[1]
+    fxx_s = jnp.zeros((N-1, Nx, Nx, Nx))
+    fux_s = jnp.zeros((N-1, Nx, Nu, Nx))
+    fuu_s = jnp.zeros((N-1, Nx, Nu, Nu))
+
+    # Cost derivatives as usual
+    lxs, lus = jax.vmap(gradrunningcost)(Xs[:-1], Us)
+    (lxxs, lxus), (luxs, luus) = jax.vmap(hessianrunningcost)(Xs[:-1], Us)
+    lxs = dt * lxs
+    lus = dt * lus
+    lxxs = dt * lxxs
+    lxus = dt * lxus
+    luxs = dt * luxs
+    luus = dt * luus
+
+    # Terminal cost on last state (Xs[-1])
+    lfx = gradterminalcost(Xs[-1])
+    lfxx = hessiantterminalcost(Xs[-1])
+
+    return TrajDerivatives(
+        fxs=fx_s, fus=fu_s,
+        fxxs=fxx_s, fxus=None, fuxs=fux_s, fuus=fuu_s,
+        lxs=lxs, lus=lus,
+        lxxs=lxxs, lxus=lxus, luxs=luxs, luus=luus,
+        lfx=lfx, lfxx=lfxx
+    )
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def input_smoothed_traj_batch_derivatives_qsim_spm(
+    Xs,  # (N, Nx)
+    Us,  # (N-1, Nu)
+    sigma,
+    toproblem: "TOProblemDefinition",
+    toalgorithm: "TOAlgorithm",
+    seed: int = 0,
+):
+    """
+    Compute all derivatives for a trajectory using input_smoothed_dynamics_derivatives for dynamics part.
+    Returns:
+        TrajDerivatives object with attributes:
+            fx, fu: (N-1, Nx, Nx), (N-1, Nx, Nu)
+            fxx, fxu, fux, fuu: (N-1, Nx, Nx, Nx), (N-1, Nx, Nx, Nu), (N-1, Nx, Nu, Nx), (N-1, Nx, Nu, Nu)
+            lx, lu: (N-1, Nx), (N-1, Nu)
+            lxx, lxu, lux, luu: (N-1, Nx, Nx), (N-1, Nx, Nu), (N-1, Nu, Nx), (N-1, Nu, Nu)
+            lfx: (Nx,)
+            lfxx: (Nx, Nx)
+    """
+    
+    spg_func = get_spg_func(toalgorithm.params.spg_method)
+    xdim = toproblem.modelparams.state_dim
+    udim = toproblem.modelparams.input_dim
+    dt = toproblem.modelparams.dt
+    # wsp, usp = spg_func(udim, toalgorithm.params.spg_params)
+    cov_diag = jnp.concatenate([jnp.full((udim,), sigma)])
+    cov_matrix = jnp.diag(cov_diag)
+    _, chol_Cov_U = safe_cholesky_eig(cov_matrix)
+
+    Zs = jnp.concatenate([Xs[:-1], Us], axis=1)  # shape (N-1, Nx+Nu)
+
+    # prepare per-step keys and vmap the sigma-point generator to produce distinct wsp/usp per step
+    Tm1 = Zs.shape[0]
+    base_key = random.PRNGKey(int(seed))
+    keys = random.split(base_key, Tm1)
+
+    spg_params = toalgorithm.params.spg_params if hasattr(toalgorithm.params, "spg_params") else toalgorithm.params.spg_params
+
+    def spg_call(key):
+        # Prefer to pass params as a dict with key so stochastic generators use it.
+        if isinstance(spg_params, dict):
+            params_with_key = dict(spg_params)
+            params_with_key["key"] = key
+            wsp, usp = spg_func(udim, params_with_key)
+        else:
+            # fallback: try to call with params directly (deterministic SPG will ignore key)
+            try:
+                wsp, usp = spg_func(udim, spg_params)
+            except Exception:
+                wsp, usp = spg_func(udim, {"key": key})
+        return jnp.asarray(wsp), jnp.asarray(usp)
+
+    # vmapped generator: wsp_seq shape (T-1, N_sigma), usp_seq shape (T-1, nz, N_sigma)
+    wsp_seq, usp_seq = jax.vmap(spg_call)(keys)
+    
+    # Get cost derivatives as usual
+    gradrunningcost = toproblem.gradrunningcost
+    hessianrunningcost = toproblem.hessianrunningcost
+    gradterminalcost = toproblem.gradterminalcost
+    hessiantterminalcost = toproblem.hessiantterminalcost
+
+    # Prepare dynamics functions
+    f = toproblem.dynamics
+    fx = toproblem.graddynamics
+
+    def calc_smoothed_dynamics_derivatives(Zs, wsp, usp):
+
+        Us = Zs[xdim:]
+        SPs = Us[:, None] + chol_Cov_U @ usp  # shape (nu, N_sigma)
+        N_sigma = usp.shape[1]
+        # Build xs as repeated nominal state for each sigma point: shape (N_sigma, xdim)
+        xs = jnp.tile(Zs[:xdim][None, :], (N_sigma, 1))
+        us = SPs.T  # shape (N_sigma, nu)
+        nSPs = Us[:, None] - chol_Cov_U @ usp  # shape (nu, N_sigma)
+        nxs = xs
+        nus = nSPs.T  # shape (N_sigma, nu)
+        
+        f_plus, fx_plus, fu_plus, _ = fx(xs,us)  # [N, Nx]
+        f_minus, fx_minus, fu_minus, _ = fx(nxs,nus)  # [N, Nx]
+        f0 = f(Zs[:xdim], Zs[xdim:])  # [Nx]
+
+        fx_mean = 0.5 * (fx_plus + fx_minus)
+        fx_diff = 0.5 * (fx_plus - fx_minus)
+        fx_s = jnp.einsum('n,nij->ij', wsp, fx_mean)
+        # fx_s = jnp.einsum('n,nij->ij', wsp, fx_plus)
+        # fx_s = fx(Zs[:xdim], Zs[xdim:])
+
+        fu_mean = 0.5 * (fu_plus + fu_minus)
+        fu_s = jnp.einsum('n,nij->ij', wsp, fu_mean)
+
+        # f_plus_mean = wsp @ f_plus  # weighted mean of f_plus over sigma points
+        # f_minus_mean = wsp @ f_minus  # weighted mean of f_minus over sigma points
+        # xs_all = jnp.concatenate([xs, nxs], axis=0)        # (2*N_sigma, Nx)
+        # us_all = jnp.concatenate([us, nus], axis=0)        # (2*N_sigma, Nu)
+        # f_all  = jnp.concatenate([f_plus, f_minus], axis=0) # (2*N_sigma, Nx)
+        # w_all  = jnp.concatenate([wsp, wsp], axis=0)       # (2*N_sigma,)
+
+        # f_all_mean = 0.5 * w_all @ f_all
+        # _, fu_s = calc_AB_lstsq(xs_all, us_all, f_all, f_all_mean, Zs[:xdim], Zs[xdim:])
+        # # _, fu_s = calc_AB_lstsq(xs, us, f_plus, f_plus_mean, Zs[:xdim], Zs[xdim:])
+
+        return fx_s, fu_s
+    
+    fx_s, fu_s = jax.vmap(calc_smoothed_dynamics_derivatives)(Zs, wsp_seq, usp_seq)
+
+    
     # Create zeros for higher-order derivatives
     N = Xs.shape[0]
     Nx = Xs.shape[1]
@@ -2752,6 +3015,56 @@ def forward_iteration_wup(
 
         def try_eps(_):
             (Xs_try, Us_try, SPs_try, nX_SPs_try, Covs_try, chol_try), V_try = forward_pass_wup(
+                Xs, Us, Ks, ks, cov_policy, toproblem, toalgorithm, eps
+            )
+            accept = V_try < Vprev
+            eps_out = lax.select(accept, eps, eps_curr)
+            V_out = lax.select(accept, V_try, V_curr)
+            Xs_out = lax.select(accept, Xs_try, Xs_curr)
+            Us_out = lax.select(accept, Us_try, Us_curr)
+            SPs_out = lax.select(accept, SPs_try, SPs_curr)
+            nX_SPs_out = lax.select(accept, nX_SPs_try, nX_SPs_curr)
+            Covs_out = lax.select(accept, Covs_try, Covs_curr)
+            chol_out = lax.select(accept, chol_try, chol_Covs_curr)
+            done_out = done | accept
+            return (eps_out, V_out, Xs_out, Us_out, done_out, SPs_out, nX_SPs_out, Covs_out, chol_out), None
+
+        def skip(_):
+            return (eps_curr, V_curr, Xs_curr, Us_curr, done, SPs_curr, nX_SPs_curr, Covs_curr, chol_Covs_curr), None
+
+        carry_out, _ = lax.cond(done, skip, try_eps, operand=None)
+        return carry_out, None
+
+    final_carry, _ = lax.scan(body, carry0, eps_list)
+    (eps_used, V_new, Xs_new, Us_new, done,
+     SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new) = final_carry
+
+    return Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new
+
+@partial(jax.jit, static_argnames=("toproblem", "toalgorithm"))
+def forward_iteration_qsim_wup(
+    Xs, Us,
+    Ks, ks,
+    Vprev, dV,
+    cov_policy,
+    SPs, nX_SPs, Covs_Zs, chol_Covs_Zs,
+    toproblem: "TOProblemDefinition",
+    toalgorithm: "TOAlgorithm",
+):
+    """
+    Like forward_iteration_list but for the sigma-point forward_pass_wup.
+    Returns (Xs_new, Us_new, V_new, eps_used, done, SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new)
+    # """
+    eps_list = toalgorithm.params.eps_list
+    eps_list = jnp.asarray(eps_list)
+    eps0 = eps_list[0]
+    carry0 = (eps0, Vprev, Xs, Us, False, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs)
+
+    def body(carry, eps):
+        eps_curr, V_curr, Xs_curr, Us_curr, done, SPs_curr, nX_SPs_curr, Covs_curr, chol_Covs_curr = carry
+
+        def try_eps(_):
+            (Xs_try, Us_try, SPs_try, nX_SPs_try, Covs_try, chol_try), V_try = forward_pass_qsim_wup(
                 Xs, Us, Ks, ks, cov_policy, toproblem, toalgorithm, eps
             )
             accept = V_try < Vprev

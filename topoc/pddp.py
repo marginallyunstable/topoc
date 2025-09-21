@@ -1,5 +1,7 @@
 from typing import NamedTuple, Callable, Optional, Tuple, Any, TYPE_CHECKING
 from collections import namedtuple
+from jax import config
+config.update("jax_enable_x64", True)
 from functools import partial
 from jax import Array
 import jax
@@ -13,9 +15,9 @@ from topoc.types import *
 from topoc.utils import *
 import topoc.utils as utils
 
-class SPPDP():
+class PDDP():
     """
-    TO with Sigma Point-based Probabilistic Differential Dynamic Programming (SPPDP)
+    Probabilistic Differential Dynamic Programming (PDDP)
     """
 
     def __init__(
@@ -51,15 +53,20 @@ class SPPDP():
         cov_policy_inv = (1/sigma_u) * jnp.broadcast_to(jnp.eye(Nu), (H-1, Nu, Nu))
 
         (xbar, ubar, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs), Vbar = forward_pass_wup(xbar, ubar, K, k, cov_policy, self.toproblem, self.toalgorithm)
+        # (xbar, ubar, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs), Vbar = forward_pass_qsim_wup(xbar, ubar, K, k, cov_policy, self.toproblem, self.toalgorithm)
         # (xbar, ubar, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs), Vbar = forward_pass_wup_init(xbar, ubar, K, k, cov_policy, self.toproblem, self.toalgorithm)
         
         # endregion: Initialize Simulation
+        # self.toalgorithm.params.lam = Vbar
+        # zeta = (H+1)/Vbar
+        # zeta = Vbar
 
         # region: Algorithm Iterations
 
         iter = 1
         Change = jnp.inf
         Vstore = [Vbar]
+        Vred = []
         regularization = 0.0
         # call the initialization backward pass only once
         first_backward = True
@@ -100,6 +107,17 @@ class SPPDP():
                 # Note: this doesn't need to be done for other algorithms, because others calculate k, K directly and not UPDATE it.
                 K = K_new
                 k = k_new
+
+                # # Regularize cov_policy_new and compute its inverse using solve with vmap
+                # eps_reg = 1e-5
+                # Nu_local = cov_policy_new.shape[-1]
+                # I_Nu = jnp.eye(Nu_local)
+                # cov_policy_reg = cov_policy_new + eps_reg * jnp.broadcast_to(I_Nu, cov_policy_new.shape)
+                # # inverse each matrix via solve(A, I)
+                # cov_policy_inv_new = jax.vmap(lambda A: jnp.linalg.solve(A, I_Nu))(cov_policy_reg)
+                # cov_policy = cov_policy_reg
+                # cov_policy_inv = cov_policy_inv_new
+
                 cov_policy = cov_policy_new
                 cov_policy_inv = cov_policy_inv_new
 
@@ -120,11 +138,17 @@ class SPPDP():
                     xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs,
                     self.toproblem, self.toalgorithm
                 )
+                # xbar_new, ubar_new, Vbar_new, eps, done, \
+                #       SPs_new, nX_SPs_new, Covs_Zs_new, chol_Covs_Zs_new = forward_iteration_qsim_wup(
+                #     xbar, ubar, K, k, Vprev, dV, cov_policy, SPs, nX_SPs, Covs_Zs, chol_Covs_Zs,
+                #     self.toproblem, self.toalgorithm
+                # )
 
                 print(f"eps_opt: {eps_opt}")
 
                 if not done:
                     Vstore.append(Vprev)
+                    Vred.append(jnp.nan)
                     zeta = max(zeta / zeta_factor, zeta_min)
                     print(f"Line Search exhausted. dV value expected was: {dV}. Zeta value is set to: {zeta}")
                     break
@@ -148,11 +172,14 @@ class SPPDP():
 
                 Vstore.append(Vbar)
                 Change = Vprev - Vbar
+                Vred.append(Change)
 
                 print(f"Forward Iteration: eps = {eps}, done = {done}")
                 print(f"Vprev: {Vprev}, Vbar: {Vbar}, Change: {Change}")
 
                 zeta = zeta * zeta_factor
+                # # zeta = 1
+                # zeta = (H+1)/Vbar
                 print(f"Line Search succeeded. Zeta value is set to: {zeta}")
                 
                 # Stupid! but keeping this structure in case complete M-step of EM is performed
@@ -168,8 +195,8 @@ class SPPDP():
                 break
 
 
-        Result = namedtuple('Result', ['xbar', 'ubar', 'Vstore'])
-        return Result(xbar=xbar, ubar=ubar, Vstore=Vstore)
+        Result = namedtuple('Result', ['xbar', 'ubar', 'Vstore', 'Vred'])
+        return Result(xbar=xbar, ubar=ubar, Vstore=Vstore, Vred=Vred)
 
 
 

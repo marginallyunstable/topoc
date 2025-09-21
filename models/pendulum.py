@@ -1,4 +1,4 @@
-"""Block on ground models"""
+"""Pendulum models"""
 
 from typing import Any, Optional
 from jax import Array

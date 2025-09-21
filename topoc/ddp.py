@@ -1,5 +1,7 @@
 from typing import NamedTuple, Callable, Optional, Tuple, Any, TYPE_CHECKING
 from collections import namedtuple
+from jax import config
+config.update("jax_enable_x64", True)
 from functools import partial
 from jax import Array
 import jax
@@ -77,9 +79,6 @@ class DDP():
         
             Vprev = Vbar # Store previous value to check post forward iteration
 
-            # xbar, ubar, Vbar, eps, done = forward_iteration(
-            #     xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm, max_fi_iters=self.toalgorithm.params.max_fi_iters
-            # )
             xbar, ubar, Vbar, eps, done = forward_iteration(
                 xbar, ubar, K, k, Vprev, dV, self.toproblem, self.toalgorithm
             )

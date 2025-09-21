@@ -64,9 +64,9 @@ xbar_ddp, ubar_ddp, Vstore_ddp = tosolve_ddp.result.xbar, tosolve_ddp.result.uba
 # endregion DDP
 
 
-# region RDDP1
+# region SCSDDP (renamed from RDDP1)
 
-toprob_rddp1 = TOProblemDefinition(
+toprob_scsddp = TOProblemDefinition(
     runningcost=runningcost,
     terminalcost=terminalcost,
     dynamics=dynamics,
@@ -76,9 +76,9 @@ toprob_rddp1 = TOProblemDefinition(
     modelparams=modelparams
 )
 
-# Define RDDP1 algorithm parameters (example values)
-algorithm_rddp1 = TOAlgorithm(
-    AlgorithmName.RDDP1,
+# Define SCSDDP algorithm parameters (example values)
+algorithm_scsddp = TOAlgorithm(
+    AlgorithmName.SCSDDP,
     use_second_order_info=True,
     sigma_x=1e-6,
     sigma_u=1e-2,
@@ -92,17 +92,17 @@ algorithm_rddp1 = TOAlgorithm(
     spg_params={"order": 3**3},
 )
 
-# Example usage: create and solve the problem with RDDP1
-tosolve_rddp1 = TOSolve(toprob_rddp1, algorithm_rddp1)
-xbar_rddp1, ubar_rddp1, Vstore_rddp1 = tosolve_rddp1.result.xbar, tosolve_rddp1.result.ubar, tosolve_rddp1.result.Vstore
+# Example usage: create and solve the problem with SCSDDP
+tosolve_scsddp = TOSolve(toprob_scsddp, algorithm_scsddp)
+xbar_scsddp, ubar_scsddp, Vstore_scsddp = tosolve_scsddp.result.xbar, tosolve_scsddp.result.ubar, tosolve_scsddp.result.Vstore
 
 
-# endregion RDDP1
+# endregion SCSDDP
 
 
-# region RDDP2
+# region CSDDP (renamed from RDDP2)
 
-toprob_rddp2 = TOProblemDefinition(
+toprob_csddp = TOProblemDefinition(
     runningcost=runningcost,
     terminalcost=terminalcost,
     dynamics=dynamics,
@@ -112,9 +112,9 @@ toprob_rddp2 = TOProblemDefinition(
     modelparams=modelparams
 )
 
-# Define RDDP2 algorithm parameters (example values)
-algorithm_rddp2 = TOAlgorithm(
-    AlgorithmName.RDDP2,
+# Define CSDDP algorithm parameters (example values)
+algorithm_csddp = TOAlgorithm(
+    AlgorithmName.CSDDP,
     use_second_order_info=True,
     sigma=1e-2,
     alpha=0.1,
@@ -122,21 +122,20 @@ algorithm_rddp2 = TOAlgorithm(
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=500,
     max_iters=50,
     spg_method='g_ws',
     spg_params={"order": 3},
 )
 
-tosolve_rddp2 = TOSolve(toprob_rddp2, algorithm_rddp2)
-xbar_rddp2, ubar_rddp2, Vstore_rddp2 = tosolve_rddp2.result.xbar, tosolve_rddp2.result.ubar, tosolve_rddp2.result.Vstore
+tosolve_csddp = TOSolve(toprob_csddp, algorithm_csddp)
+xbar_csddp, ubar_csddp, Vstore_csddp = tosolve_csddp.result.xbar, tosolve_csddp.result.ubar, tosolve_csddp.result.Vstore
 
 
-# endregion RDDP2
+# endregion CSDDP
 
-# region SPPDP
+# region PDDP (renamed from SPPDP)
 
-toprob_sppdp = TOProblemDefinition(
+toprob_pddp = TOProblemDefinition(
     runningcost=runningcost,
     terminalcost=terminalcost,
     dynamics=dynamics,
@@ -147,9 +146,9 @@ toprob_sppdp = TOProblemDefinition(
     modelparams=modelparams
 )
 
-# Define SPPDP algorithm parameters (example values)
-algorithm_sppdp = TOAlgorithm(
-    AlgorithmName.SPPDP,
+# Define PDDP algorithm parameters (example values)
+algorithm_pddp = TOAlgorithm(
+    AlgorithmName.PDDP,
     use_second_order_info=True,
     spg_method='gh_ws',
     spg_params={"order": 3},
@@ -163,21 +162,19 @@ algorithm_sppdp = TOAlgorithm(
 )
 
 
-# Example usage: create and solve the problem with SPPDP
-tosolve_sppdp = TOSolve(toprob_sppdp, algorithm_sppdp)
-xbar_sppdp, ubar_sppdp, Vstore_sppdp = tosolve_sppdp.result.xbar, tosolve_sppdp.result.ubar, tosolve_sppdp.result.Vstore
+# Example usage: create and solve the problem with PDDP
+tosolve_pddp = TOSolve(toprob_pddp, algorithm_pddp)
+xbar_pddp, ubar_pddp, Vstore_pddp = tosolve_pddp.result.xbar, tosolve_pddp.result.ubar, tosolve_pddp.result.Vstore
 
-# endregion SPPDP
+# endregion PDDP
 
-
-# endregion SPPDP
 
 # recreate algorithms list and call the beautified plotting function
 algorithms = [
     ("DDP", xbar_ddp, ubar_ddp, Vstore_ddp),
-    ("SCS-DDP", xbar_rddp1, ubar_rddp1, Vstore_rddp1),
-    ("CS-DDP", xbar_rddp2, ubar_rddp2, Vstore_rddp2),
-    ("P-PDP", xbar_sppdp, ubar_sppdp, Vstore_sppdp),
+    ("SCS-DDP", xbar_scsddp, ubar_scsddp, Vstore_scsddp),
+    ("CS-DDP", xbar_csddp, ubar_csddp, Vstore_csddp),
+    ("PDDP", xbar_pddp, ubar_pddp, Vstore_pddp),
 ]
 
 plot_compare_pendulum_results(algorithms, x0, xg, modelparams)

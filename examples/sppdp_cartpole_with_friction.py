@@ -5,8 +5,9 @@ import jax.numpy as jnp
 from functools import partial
 from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_cartpole_results
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
-from models.cartpole import cartpole_f_with_friction  # Assumes this exists
+from models.cartpole import cartpole_with_friction  # Assumes this exists
 from topoc.types import ModelParams, AlgorithmName
+import os, numpy as np
 
 # Define model parameters (example values)
 state_dim = 4
@@ -23,6 +24,7 @@ modelparams = ModelParams(
 
 # Define initial and goal states
 x0 = jnp.array([-1.0, 0.0, 0.0, 0.0])
+covx0 = 1e-6 * jnp.eye(state_dim)
 xg = jnp.array([0.0, 0.0, jnp.pi, 0.0])
 # Define initial input (control)
 u0 = jnp.array([0.0])
@@ -30,57 +32,67 @@ u0 = jnp.array([0.0])
 # Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 1*jnp.eye(input_dim)
+R = 500*jnp.eye(input_dim)
 
-params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 0.5, "dt": dt}
+params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 0.5}
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
 # Define cost functions using partial
 
-dynamics = partial(cartpole_f_with_friction, params=params_dynamics)
+dynamics = partial(cartpole_with_friction, params=params_dynamics)
 terminalcost = partial(quadratic_terminal_cost, xg=xg, params=params_terminal)
 runningcost = partial(quadratic_running_cost, xg=xg, params=params_running)
+
 
 toprob = TOProblemDefinition(
     runningcost=runningcost,
     terminalcost=terminalcost,
     dynamics=dynamics,
     starting_state=x0,
+    starting_state_cov=covx0,
     starting_input=u0,
     goal_state=xg,
     modelparams=modelparams
 )
 
-# Define RDDP1 algorithm parameters (example values)
+# Define SPPDP algorithm parameters (example values)
 algorithm = TOAlgorithm(
-    AlgorithmName.RDDP1,
-    use_second_order_info=False, # NOTE
-    sigma_x=1e-6,
-    sigma_u=10,
-    alpha=0.1,
-    alpha_red=2.0,
-    sigma_red=2.0,
-    targetalpha=1e-6,
-    targetsigma=1e-6,
-    mcsamples=500, # NOTE
-    max_iters=50,
+    AlgorithmName.PDDP,
+    use_second_order_info=False,   # NOTE
     spg_method='gh_ws',
     spg_params={"order": 5},
+    eta=0.01,
+    lam=201,
+    zeta=1,
+    zeta_factor=2,
+    zeta_min=1e-2,
+    sigma_u=15,
+    max_iters=150
 )
 
 print("Algorithm parameters:")
 print("Name:", algorithm.algo_type)
 print("Gamma:", algorithm.params.gamma)
 print("Beta:", algorithm.params.beta)
-print("Sigma_x:", algorithm.params.sigma_x)
+print("SPG Method:", algorithm.params.spg_method)
+print("Eta:", algorithm.params.eta)
+print("Lam:", algorithm.params.lam)
+print("Zeta:", algorithm.params.zeta)
+print("Lam Factor:", algorithm.params.zeta_factor)
+print("Lam Min:", algorithm.params.zeta_min)
 print("Sigma_u:", algorithm.params.sigma_u)
-print("Alpha:", algorithm.params.alpha)
-print("Use second order info:", algorithm.params.use_second_order_info)
+print("Max iters:", algorithm.params.max_iters)
+print("Max fi iters:", algorithm.params.max_fi_iters)
 
-# Example usage: create and solve the problem with RDDP1
 tosolve = TOSolve(toprob, algorithm)
-xbar, ubar, Vstore = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore
+xbar, ubar, Vstore, Vred = tosolve.result.xbar, tosolve.result.ubar, tosolve.result.Vstore, tosolve.result.Vred
+
+os.makedirs('/workspace/topoc/results', exist_ok=True)
+np.save('/workspace/topoc/results/RuleX.npy', np.array(Vstore))
+
+print("Starting cost:", Vstore[0])  # Print the starting value of the cost function
+print("Final cost:", Vstore[-1])    # Print the final value of the cost function
 
 # ---- Call plotting function ----
 plot_cartpole_results(tosolve.result, x0, xg, modelparams)

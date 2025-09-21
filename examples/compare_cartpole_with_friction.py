@@ -3,10 +3,12 @@ from jax import config
 config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from functools import partial
-from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_block_results
+from topoc.utils import quadratic_running_cost, quadratic_terminal_cost, plot_compare_cartpole_results
 from topoc.base import TOProblemDefinition, TOAlgorithm, TOSolve
-from models.cartpole import cartpole, cartpole_with_friction
+from models.cartpole import cartpole_with_friction
 from topoc.types import ModelParams, AlgorithmName
+import os
+import numpy as np
 
 # Define model parameters (example values)
 state_dim = 4
@@ -22,18 +24,17 @@ modelparams = ModelParams(
 )
 
 # Define initial and goal states
-x0 = jnp.array([0.0, 0.0, jnp.pi, 0.0])
+x0 = jnp.array([-1.0, 0.0, 0.0, 0.0])
 covx0 = 1e-6 * jnp.eye(state_dim)
-xg = jnp.array([0.0, 0.0, 0.0, 0.0])
+xg = jnp.array([0.0, 0.0, jnp.pi, 0.0])
 # Define initial input (control)
 u0 = jnp.array([0.0])
 
-# Define cost matrices
 P = 1000000*jnp.eye(state_dim)
 Q = 1*jnp.eye(state_dim)
-R = 5*jnp.eye(input_dim)
+R = 500*jnp.eye(input_dim)
 
-params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 1.0, "dt": dt}
+params_dynamics = {"mc": 1.0, "mp": 0.1, "g": 9.81, "l": 0.5}
 params_terminal = {"P": P}
 params_running = {"Q": Q, "R": R}
 
@@ -57,8 +58,8 @@ toprob_ddp = TOProblemDefinition(
 )
 
 algorithm_ddp = TOAlgorithm(AlgorithmName.DDP, 
-                            use_second_order_info=False, # NOTE
-                            max_iters=50)
+                            use_second_order_info=True, # NOTE
+                            max_iters=150)
 
 tosolve_ddp = TOSolve(toprob_ddp, algorithm_ddp)
 xbar_ddp, ubar_ddp, Vstore_ddp = tosolve_ddp.result.xbar, tosolve_ddp.result.ubar, tosolve_ddp.result.Vstore
@@ -66,9 +67,9 @@ xbar_ddp, ubar_ddp, Vstore_ddp = tosolve_ddp.result.xbar, tosolve_ddp.result.uba
 # endregion DDP
 
 
-# region RDDP1
+# region SCSDDP (renamed from RDDP1)
 
-toprob_rddp1 = TOProblemDefinition(
+toprob_scsddp = TOProblemDefinition(
     runningcost=runningcost,
     terminalcost=terminalcost,
     dynamics=dynamics,
@@ -78,32 +79,33 @@ toprob_rddp1 = TOProblemDefinition(
     modelparams=modelparams
 )
 
-# Define RDDP1 algorithm parameters (example values)
-algorithm_rddp1 = TOAlgorithm(
-    AlgorithmName.RDDP1,
-    use_second_order_info=True,
+# Define SCSDDP algorithm parameters (example values)
+algorithm_scsddp = TOAlgorithm(
+    AlgorithmName.SCSDDP,
+    use_second_order_info=False, # NOTE
     sigma_x=1e-6,
-    sigma_u=10,
+    sigma_u=15,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=500, # NOTE
-    max_iters=50,
+    max_iters=150,
+    spg_method='gh_ws',
+    spg_params={"order": 5},
 )
 
-# Example usage: create and solve the problem with RDDP1
-tosolve_rddp1 = TOSolve(toprob_rddp1, algorithm_rddp1)
-xbar_rddp1, ubar_rddp1, Vstore_rddp1 = tosolve_rddp1.result.xbar, tosolve_rddp1.result.ubar, tosolve_rddp1.result.Vstore
+# # Example usage: create and solve the problem with SCSDDP
+tosolve_scsddp = TOSolve(toprob_scsddp, algorithm_scsddp)
+xbar_scsddp, ubar_scsddp, Vstore_scsddp = tosolve_scsddp.result.xbar, tosolve_scsddp.result.ubar, tosolve_scsddp.result.Vstore
 
 
-# endregion RDDP1
+# endregion SCSDDP
 
 
-# region RDDP2
+# region CSDDP (renamed from RDDP2)
 
-toprob_rddp2 = TOProblemDefinition(
+toprob_csddp = TOProblemDefinition(
     runningcost=runningcost,
     terminalcost=terminalcost,
     dynamics=dynamics,
@@ -113,29 +115,30 @@ toprob_rddp2 = TOProblemDefinition(
     modelparams=modelparams
 )
 
-# Define RDDP2 algorithm parameters (example values)
-algorithm_rddp2 = TOAlgorithm(
-    AlgorithmName.RDDP2,
-    use_second_order_info=True,
-    sigma=1e-2,
+# Define CSDDP algorithm parameters (example values)
+algorithm_csddp = TOAlgorithm(
+    AlgorithmName.CSDDP,
+    use_second_order_info=False,   # NOTE
+    sigma=15,
     alpha=0.1,
     alpha_red=2.0,
     sigma_red=2.0,
     targetalpha=1e-6,
     targetsigma=1e-6,
-    mcsamples=100,
-    max_iters=50,
+    max_iters=150,
+    spg_method='gh_ws',
+    spg_params={"order": 5},
 )
 
-tosolve_rddp2 = TOSolve(toprob_rddp2, algorithm_rddp2)
-xbar_rddp2, ubar_rddp2, Vstore_rddp2 = tosolve_rddp2.result.xbar, tosolve_rddp2.result.ubar, tosolve_rddp2.result.Vstore
+tosolve_csddp = TOSolve(toprob_csddp, algorithm_csddp)
+xbar_csddp, ubar_csddp, Vstore_csddp = tosolve_csddp.result.xbar, tosolve_csddp.result.ubar, tosolve_csddp.result.Vstore
 
 
-# endregion RDDP2
+# endregion CSDDP
 
-# region SPPDP
+# region PDDP (renamed from SPPDP)
 
-toprob_sppdp = TOProblemDefinition(
+toprob_pddp = TOProblemDefinition(
     runningcost=runningcost,
     terminalcost=terminalcost,
     dynamics=dynamics,
@@ -146,83 +149,127 @@ toprob_sppdp = TOProblemDefinition(
     modelparams=modelparams
 )
 
-# Define SPPDP algorithm parameters (example values)
-algorithm_sppdp = TOAlgorithm(
-    AlgorithmName.SPPDP,
+# Define PDDP algorithm parameters (example values)
+algorithm_pddp = TOAlgorithm(
+    AlgorithmName.PDDP,
+    use_second_order_info=False,
     spg_method='gh_ws',
     spg_params={"order": 5},
     eta=0.01,
-    lam=100,
+    lam=201,
+    # eta=1,
+    # lam=1e10,
     zeta=1,
     zeta_factor=2,
     zeta_min=1e-2,
-    sigma_u=1e-2,
-    max_iters=50
+    sigma_u=15,
+    max_iters=150
 )
 
 
-# Example usage: create and solve the problem with SPPDP
-tosolve_sppdp = TOSolve(toprob_sppdp, algorithm_sppdp)
-xbar_sppdp, ubar_sppdp, Vstore_sppdp = tosolve_sppdp.result.xbar, tosolve_sppdp.result.ubar, tosolve_sppdp.result.Vstore
+# Example usage: create and solve the problem with PDDP
+tosolve_pddp = TOSolve(toprob_pddp, algorithm_pddp)
+xbar_pddp, ubar_pddp, Vstore_pddp = tosolve_pddp.result.xbar, tosolve_pddp.result.ubar, tosolve_pddp.result.Vstore
 
-# endregion SPPDP
+# endregion PDDP
 
 
-# Compare results
-import matplotlib.pyplot as plt
-
+# recreate algorithms list and call the beautified plotting function
 algorithms = [
     ("DDP", xbar_ddp, ubar_ddp, Vstore_ddp),
-    ("RDDP1", xbar_rddp1, ubar_rddp1, Vstore_rddp1),
-    ("RDDP2", xbar_rddp2, ubar_rddp2, Vstore_rddp2),
-    ("SPPDP", xbar_sppdp, ubar_sppdp, Vstore_sppdp),
+    ("SCS-DDP", xbar_scsddp, ubar_scsddp, Vstore_scsddp),
+    ("CS-DDP", xbar_csddp, ubar_csddp, Vstore_csddp),
+    ("PDDP", xbar_pddp, ubar_pddp, Vstore_pddp),
 ]
 
-colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
-linestyles = ["-", "--", "-.", ":"]
+plot_compare_cartpole_results(algorithms, x0, xg, modelparams)
 
-# Create a 2x2 grid of subplots: top-left = cart pos vs vel, top-right = pendulum pos vs vel,
-# bottom-left = input vs time, bottom-right = Vstore over iterations
-fig, axs = plt.subplots(2, 2, figsize=(14, 10))
 
-# Subplot 1 (top-left): cart position vs cart velocity
-for i, (name, xbar, _, _) in enumerate(algorithms):
-    axs[0, 0].plot(xbar[:, 0], xbar[:, 1], label=name, color=colors[i], linestyle=linestyles[i])
-axs[0, 0].set_xlabel("Cart Position")
-axs[0, 0].set_ylabel("Cart Velocity")
-axs[0, 0].set_title("Cart: Velocity vs Position")
-axs[0, 0].legend()
-axs[0, 0].grid(True)
+# region: Save all algorithm results in one categorized file
 
-# Subplot 2 (top-right): pendulum angular position vs angular velocity
-for i, (name, xbar, _, _) in enumerate(algorithms):
-    axs[0, 1].plot(xbar[:, 2], xbar[:, 3], label=name, color=colors[i], linestyle=linestyles[i])
-axs[0, 1].set_xlabel("Pendulum Angle")
-axs[0, 1].set_ylabel("Pendulum Angular Velocity")
-axs[0, 1].set_title("Pendulum: Angular Velocity vs Angle")
-axs[0, 1].legend()
-axs[0, 1].grid(True)
+os.makedirs("results", exist_ok=True)
+def _sanitized_name(name: str) -> str:
+    return name.lower().replace("-", "_").replace(" ", "_")
 
-# Subplot 3 (bottom-left): input vs time
-# Use per-algorithm control timesteps to match ubar length (controls often have one less timestep than states)
-for i, (name, _, ubar, _) in enumerate(algorithms):
-    nt = ubar.shape[0]
-    timesteps_ctrl = jnp.arange(nt) * dt
-    axs[1, 0].plot(timesteps_ctrl, ubar[:, 0], label=name, color=colors[i], linestyle=linestyles[i])
-axs[1, 0].set_xlabel("Time [s]")
-axs[1, 0].set_ylabel("Input")
-axs[1, 0].set_title("Input vs Time")
-axs[1, 0].legend()
-axs[1, 0].grid(True)
+def save_all_results(algorithms, dt, base_dir="results", filename="all_algorithms_solution.npz"):
+    """
+    Save all algorithm results into a single .npz file.
+    The file contains keys of the form:
+      <sanitized_name>_xbar, <sanitized_name>_ubar, <sanitized_name>_Vstore
+    and metadata keys:
+      algorithm_names (original names), sanitized_names, dt
+    """
+    os.makedirs(base_dir, exist_ok=True)
+    filepath = os.path.join(base_dir, filename)
 
-# Subplot 4 (bottom-right): Vstore over iterations
-for i, (name, _, _, Vstore) in enumerate(algorithms):
-    axs[1, 1].plot(jnp.arange(len(Vstore)), Vstore, label=name, color=colors[i], linestyle=linestyles[i])
-axs[1, 1].set_xlabel("Iteration")
-axs[1, 1].set_ylabel("Vstore")
-axs[1, 1].set_title("Vstore over Iterations")
-axs[1, 1].legend()
-axs[1, 1].grid(True)
+    data_dict = {}
+    alg_names = []
+    san_names = []
 
-plt.tight_layout()
-plt.show()
+    for name, xbar, ubar, Vstore in algorithms:
+        sname = _sanitized_name(name)
+        alg_names.append(name)
+        san_names.append(sname)
+
+        data_dict[f"{sname}_xbar"] = np.array(xbar)
+        data_dict[f"{sname}_ubar"] = np.array(ubar)
+        data_dict[f"{sname}_Vstore"] = np.array(Vstore)
+
+    data_dict["algorithm_names"] = np.array(alg_names, dtype=object)
+    data_dict["sanitized_names"] = np.array(san_names, dtype=object)
+    data_dict["dt"] = np.array(dt)
+
+    np.savez(filepath, **data_dict)
+    return filepath
+
+
+algorithms_to_save = [
+    ("DDP", xbar_ddp, ubar_ddp, Vstore_ddp),
+    ("SCS-DDP", xbar_scsddp, ubar_scsddp, Vstore_scsddp),
+    ("CS-DDP", xbar_csddp, ubar_csddp, Vstore_csddp),
+    ("PDDP", xbar_pddp, ubar_pddp, Vstore_pddp),
+]
+
+saved_path = save_all_results(algorithms_to_save, dt)
+# Update save_all_results to accept x0 and xg and save them directly
+def save_all_results(algorithms, dt, x0=None, xg=None, base_dir="results", filename="cartpole_with_friction_solution.npz"):
+    """
+    Save all algorithm results into a single .npz file.
+    The file contains keys of the form:
+      <sanitized_name>_xbar, <sanitized_name>_ubar, <sanitized_name>_Vstore
+    and metadata keys:
+      algorithm_names (original names), sanitized_names, dt, x0, xg
+    """
+    os.makedirs(base_dir, exist_ok=True)
+    filepath = os.path.join(base_dir, filename)
+
+    data_dict = {}
+    alg_names = []
+    san_names = []
+
+    for name, xbar, ubar, Vstore in algorithms:
+        sname = _sanitized_name(name)
+        alg_names.append(name)
+        san_names.append(sname)
+
+        data_dict[f"{sname}_xbar"] = np.array(xbar)
+        data_dict[f"{sname}_ubar"] = np.array(ubar)
+        data_dict[f"{sname}_Vstore"] = np.array(Vstore)
+
+    data_dict["algorithm_names"] = np.array(alg_names, dtype=object)
+    data_dict["sanitized_names"] = np.array(san_names, dtype=object)
+    data_dict["dt"] = np.array(dt)
+
+    if x0 is not None:
+        data_dict["x0"] = np.array(x0)
+    if xg is not None:
+        data_dict["xg"] = np.array(xg)
+
+    np.savez(filepath, **data_dict)
+    return filepath
+
+# Save all algorithm results in one categorized file and include start/goal
+saved_path = save_all_results(algorithms_to_save, dt, x0=x0, xg=xg)
+print(f"Saved combined results to: {saved_path}")
+
+# endregion Save results to a single .npz file

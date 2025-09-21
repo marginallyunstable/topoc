@@ -5,20 +5,21 @@ from functools import partial
 import jax
 from jax import lax, Array
 from jax.typing import ArrayLike
+from jax import config
+config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from enum import Enum
 
 from topoc.utils import linearize, quadratize
 from topoc.types import *
 from topoc.ddp import DDP
-from topoc.rddp2 import RDDP2
-from topoc.rddp1 import RDDP1
-from topoc.sppdp import SPPDP
+from topoc.csddp import CSDDP
+from topoc.scsddp import SCSDDP
+from topoc.pddp import PDDP
 
 class TOSolve:
     """
     Class to solve the trajectory optimization problem using the specified algorithm.
-    Stores results and provides utility methods.
     """
     def __init__(self, problem: "TOProblemDefinition", algorithm: "TOAlgorithm"):
         self.problem = problem
@@ -31,42 +32,17 @@ class TOSolve:
         if self.algorithm.algo_type == AlgorithmName.DDP:
             ddp = DDP(self.problem, self.algorithm)
             return ddp.solve()
-        elif self.algorithm.algo_type == AlgorithmName.RDDP1:
-            rddp1 = RDDP1(self.problem, self.algorithm)
-            return rddp1.solve()
-        elif self.algorithm.algo_type == AlgorithmName.RDDP2:
-            rddp2 = RDDP2(self.problem, self.algorithm)
-            return rddp2.solve()
-        elif self.algorithm.algo_type == AlgorithmName.SPPDP:
-            sppdp = SPPDP(self.problem, self.algorithm)
-            return sppdp.solve()
+        elif self.algorithm.algo_type == AlgorithmName.SCSDDP:
+            scsddp = SCSDDP(self.problem, self.algorithm)
+            return scsddp.solve()
+        elif self.algorithm.algo_type == AlgorithmName.CSDDP:
+            csddp = CSDDP(self.problem, self.algorithm)
+            return csddp.solve()
+        elif self.algorithm.algo_type == AlgorithmName.PDDP:
+            pddp = PDDP(self.problem, self.algorithm)
+            return pddp.solve()
         else:
             raise ValueError(f"Unknown algorithm: {self.algorithm.algo_type}")
-
-    def _rddp1_solver(self):
-        # Implement RDDP1 solver logic here
-        # Example: return {"status": "solved", "data": ...}
-        return {"status": "solved", "algorithm": "RDDP1"}
-
-    def _rddp2_solver(self):
-        # Implement RDDP2 solver logic here
-        return {"status": "solved", "algorithm": "RDDP2"}
-
-    def _spddp_solver(self):
-        # Implement SPDDP solver logic here
-        return {"status": "solved", "algorithm": "SPDDP"}
-
-    def _sppdp_solver(self):
-        # Implement SPPDP solver logic here
-        return {"status": "solved", "algorithm": "SPPDP"}
-
-    def visualize(self):
-        # Implement visualization logic here
-        print(f"Visualizing result for {self.algorithm.algo_type}")
-
-    def show_log(self):
-        # Implement logging or summary logic here
-        print(f"Log for {self.algorithm.algo_type}: {self.result}")
 
 class TOProblemDefinition():
     """
@@ -91,17 +67,6 @@ class TOProblemDefinition():
     ):
         """
         Trajectory Optimization Problem initialization.
-
-        Parameters
-        ----------
-        runningcost : RunningCostFn
-            Running cost function (x, u).
-        terminalcost : TerminalCostFn
-            Terminal cost function (xf).
-        dynamics : DynamicsFn
-            Dynamics function (x, u).
-        modelparams : ModelParams
-            Model Parameters e.g. state_dim, input_dim, horizon_len, dt.
         """
         self.runningcost = runningcost
         self.terminalcost = terminalcost
