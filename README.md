@@ -1,13 +1,14 @@
-Trajectory Optimization for non-smooth systems using the idea of (randomized) smoothing.
+Trajectory Optimization for non-smooth systems in robotics, using the idea of (randomized) smoothing from non-smooth optimization.
 
 To get started, create environment using:
 ```
 conda env create -f environment.yml
 ```
+and run the examples from ./examples
 
-## Animations
+## Simulation Results
 
-Below are GIF animations (from `results/animations`) demonstrating optimization results.
+Below are results on some simple use-cases:
 
 - 1D Box Push — 1D box constrained to move along a single axis with dry Coulomb friction
 
@@ -20,3 +21,4 @@ Below are GIF animations (from `results/animations`) demonstrating optimization 
 - Cartpole Swing Up — Cartpole with joint friction at the pole–cart joint
 
   ![Cartpole Swing Up: Cartpole with joint friction at pole-cart joint](results/animations/cartpole_compare_animation.gif)
+
