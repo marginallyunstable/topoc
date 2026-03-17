@@ -8,4 +8,4 @@ and run the examples from ./examples
 
 ## Simulation Results
 
-![Below are results on some simple use-cases](results/animations/combined.gif):
+![Below are results on some simple use-cases](results/animations/combined_results.gif):
